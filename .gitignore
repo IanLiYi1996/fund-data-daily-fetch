@@ -1,36 +1,66 @@
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
-# dependencies
-/node_modules
-/.pnp
-.pnp.js
+# Dependencies
+node_modules/
+cdk/node_modules/
 
-# testing
+# CDK
+cdk/dist/
+cdk/cdk.out/
+*.js
+*.d.ts
+!cdk/cdk.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+ENV/
+.eggs/
+*.egg-info/
+*.egg
+
+# Lambda
+lambda/.venv/
+lambda/dist/
+
+# Testing
 /coverage
+.pytest_cache/
+.coverage
+htmlcov/
 
-# next.js
-/.next/
+# Build outputs
+/build
 /out/
 
-# production
-/build
-
-# misc
+# Misc
 .DS_Store
 *.pem
+output.json
 
-# debug
+# Debug logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pip-log.txt
 
-# local env files
+# Local env files
 .env*.local
 .env
 
-# vercel
-.vercel
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
 
-# typescript
+# TypeScript
 *.tsbuildinfo
-next-env.d.ts
+
+# Reference code (for development only)
+reference/
