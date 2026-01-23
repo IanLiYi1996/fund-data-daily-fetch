@@ -69,6 +69,38 @@ def process_fetch_summary(
     }
 
 
+def upload_data_catalog(s3_client: S3Client, fetchers: List, date: datetime) -> None:
+    """Upload data catalog with descriptions for all data sources.
+
+    Args:
+        s3_client: S3 client instance
+        fetchers: List of fetcher instances
+        date: Date for partitioning
+    """
+    date_str = date.strftime("%Y-%m-%d")
+
+    # Build complete catalog
+    catalog = {
+        "generated_at": datetime.now().isoformat(),
+        "date": date_str,
+        "categories": {},
+    }
+
+    for fetcher in fetchers:
+        if hasattr(fetcher, "get_data_catalog"):
+            catalog["categories"][fetcher.category] = fetcher.get_data_catalog()
+
+    # Upload catalog to S3
+    try:
+        # Upload to date-partitioned path
+        s3_client.upload_json(catalog, f"_catalog/{date_str}/data_catalog.json")
+        # Also upload to root as latest catalog
+        s3_client.upload_json(catalog, "_catalog/latest/data_catalog.json")
+        logger.info("Data catalog uploaded successfully")
+    except Exception as e:
+        logger.warning(f"Failed to upload data catalog: {e}")
+
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Lambda handler function.
 
@@ -112,6 +144,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         StockFetcher(),
         MacroFetcher(),
     ]
+
+    # Upload data catalog
+    upload_data_catalog(s3_client, fetchers, fetch_date)
 
     # Execute fetchers and upload results
     results: List[Dict[str, Any]] = []

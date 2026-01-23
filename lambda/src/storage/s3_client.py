@@ -119,3 +119,46 @@ class S3Client:
             else:
                 self.logger.error(f"Error checking bucket: {e}")
             return False
+
+    @retry_with_backoff(max_retries=3, initial_delay=1.0)
+    def upload_json(
+        self,
+        data: dict,
+        s3_key: str,
+    ) -> dict:
+        """Upload JSON data to S3.
+
+        Args:
+            data: Dictionary to upload as JSON
+            s3_key: S3 key path
+
+        Returns:
+            Dict with upload details
+        """
+        import json
+
+        json_bytes = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+
+        self.logger.info(f"Uploading {s3_key} ({len(json_bytes):,} bytes)")
+
+        try:
+            self.s3_client.put_object(
+                Bucket=self.bucket_name,
+                Key=s3_key,
+                Body=json_bytes,
+                ContentType="application/json; charset=utf-8",
+                Metadata={
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+
+            self.logger.info(f"Successfully uploaded {s3_key}")
+            return {
+                "bucket": self.bucket_name,
+                "key": s3_key,
+                "size": len(json_bytes),
+            }
+
+        except ClientError as e:
+            self.logger.error(f"Failed to upload {s3_key}: {e}")
+            raise
