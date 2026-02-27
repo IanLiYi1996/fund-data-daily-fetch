@@ -84,8 +84,8 @@ aws cloudformation describe-stacks \
     --output table
 
 echo ""
-echo "To manually trigger the Lambda function:"
-echo "  aws lambda invoke --function-name FundDataFetchLambda output.json && cat output.json"
+echo "To manually trigger the Step Functions workflow:"
+echo "  aws stepfunctions start-execution --state-machine-arn \$(aws cloudformation describe-stacks --stack-name FundDataFetchStack --query \"Stacks[0].Outputs[?OutputKey=='StateMachineArn'].OutputValue\" --output text) --input '{\"triggered_by\": \"manual\"}'"
 echo ""
 echo "To check S3 data:"
 echo "  aws s3 ls s3://fund-data-$AWS_ACCOUNT-$AWS_REGION/ --recursive"

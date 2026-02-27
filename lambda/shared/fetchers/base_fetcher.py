@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import List, Optional
 import pandas as pd
-from utils.logger import get_logger
+from shared.utils.logger import get_logger
 
 
 @dataclass

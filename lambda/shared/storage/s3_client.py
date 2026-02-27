@@ -4,8 +4,8 @@ from typing import Optional
 import boto3
 import pandas as pd
 from botocore.exceptions import ClientError
-from utils.logger import get_logger
-from utils.retry import retry_with_backoff
+from shared.utils.logger import get_logger
+from shared.utils.retry import retry_with_backoff
 
 
 class S3Client:
