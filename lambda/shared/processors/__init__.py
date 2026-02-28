@@ -5,6 +5,7 @@ from .hk_processor import HKProcessor
 from .us_processor import USProcessor
 from .macro_processor import MacroProcessor
 from .market_overview import MarketOverviewProcessor
+from .hist_kline_processor import HistKlineProcessor
 
 __all__ = [
     "BaseProcessor",
@@ -14,4 +15,5 @@ __all__ = [
     "USProcessor",
     "MacroProcessor",
     "MarketOverviewProcessor",
+    "HistKlineProcessor",
 ]

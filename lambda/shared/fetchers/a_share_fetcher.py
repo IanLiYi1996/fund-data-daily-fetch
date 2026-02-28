@@ -9,10 +9,10 @@ class AShareFetcher(BaseFetcher):
     DATA_CATALOG = {
         "a_share_spot": {
             "name_cn": "全部A股实时行情",
-            "description": "全部A股个股实时行情数据，包含价格、涨跌幅、成交量等",
-            "source_api": "stock_zh_a_spot_em",
+            "description": "全部A股个股实时行情数据（新浪源），包含价格、涨跌幅、成交量等",
+            "source_api": "stock_zh_a_spot",
             "update_frequency": "realtime",
-            "key_fields": ["代码", "名称", "最新价", "涨跌幅", "涨跌额", "成交量", "成交额", "振幅", "换手率", "市盈率"],
+            "key_fields": ["代码", "名称", "最新价", "涨跌幅", "涨跌额", "成交量", "成交额"],
         },
         "board_industry": {
             "name_cn": "行业板块",
@@ -133,8 +133,12 @@ class AShareFetcher(BaseFetcher):
         return FetchSummary(category=self.category, results=results)
 
     def _fetch_a_spot(self):
-        """Fetch all A-share spot data."""
-        df = ak.stock_zh_a_spot_em()
+        """Fetch all A-share spot data (Sina source, replaces blocked _em API)."""
+        df = ak.stock_zh_a_spot()
+        # Add columns that exist in _em but not in Sina source, so processors don't break
+        for col in ["总市值", "市净率", "流通市值", "振幅", "换手率", "市盈率-动态"]:
+            if col not in df.columns:
+                df[col] = None
         return df
 
     def _fetch_board_industry(self):

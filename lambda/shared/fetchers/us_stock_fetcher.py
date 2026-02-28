@@ -1,34 +1,60 @@
+import pandas as pd
 import akshare as ak
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from .base_fetcher import BaseFetcher, FetchResult, FetchSummary
 
 
-class USStockFetcher(BaseFetcher):
-    """Fetcher for US stock and US macroeconomic data from akshare.
+# US famous stock lists by category (matching original 类别 values)
+_US_FAMOUS_STOCKS = {
+    "科技类": [
+        "AAPL", "MSFT", "GOOG", "AMZN", "TSLA", "NVDA", "META", "INTC",
+        "AMD", "CRM", "ORCL", "ADBE", "CSCO", "AVGO", "QCOM", "NFLX",
+        "UBER", "ABNB",
+    ],
+    "金融类": [
+        "JPM", "BAC", "GS", "MS", "WFC", "C", "BLK", "AXP", "V", "MA",
+    ],
+    "医药食品类": [
+        "JNJ", "PFE", "UNH", "ABBV", "MRK", "LLY", "TMO", "ABT",
+        "KO", "PEP", "MCD",
+    ],
+    "媒体类": [
+        "DIS", "CMCSA", "NWSA", "RBLX", "EA", "TTWO", "SPOT",
+    ],
+}
 
-    Ported from reference/investment-advisory nasdaq_hot100 + us_macro modules.
-    US stock spot data via akshare, US macro 16 indicators via akshare.
+# Flat list of all famous tickers (used for us_stock_spot)
+_ALL_US_TICKERS = sorted(
+    {sym for syms in _US_FAMOUS_STOCKS.values() for sym in syms}
+)
+
+
+class USStockFetcher(BaseFetcher):
+    """Fetcher for US stock and US macroeconomic data.
+
+    US stock spot data via yfinance (replaces blocked _em APIs).
+    US macro 16 indicators via akshare (still working fine).
     """
 
-    # Categories for stock_us_famous_spot_em
-    US_FAMOUS_CATEGORIES = ["科技类", "金融类", "医药食品类", "媒体类"]
+    US_FAMOUS_CATEGORIES = list(_US_FAMOUS_STOCKS.keys())
 
     DATA_CATALOG = {
-        # US Stock Market
+        # US Stock Market (yfinance source)
         "us_stock_spot": {
             "name_cn": "美股实时行情",
-            "description": "全部美股实时行情数据（东方财富），包含价格、涨跌幅、市值等",
-            "source_api": "stock_us_spot_em",
+            "description": "美股大盘股实时行情数据（yfinance源），包含价格、涨跌幅、市值等",
+            "source_api": "yfinance",
             "update_frequency": "realtime",
             "key_fields": ["代码", "名称", "最新价", "涨跌幅", "涨跌额", "成交量", "成交额", "总市值"],
         },
         "us_famous_spot": {
             "name_cn": "知名美股行情",
-            "description": "知名美股分类行情（科技、金融、医药、媒体），含主要NASDAQ/NYSE成分股",
-            "source_api": "stock_us_famous_spot_em",
+            "description": "知名美股分类行情（科技、金融、医药、媒体），yfinance源",
+            "source_api": "yfinance",
             "update_frequency": "realtime",
-            "key_fields": ["代码", "名称", "最新价", "涨跌幅", "成交量", "总市值"],
+            "key_fields": ["代码", "名称", "最新价", "涨跌幅", "成交量", "总市值", "类别"],
         },
-        # US Macroeconomic Data (16 indicators from reference project)
+        # US Macroeconomic Data (16 indicators — akshare, still works)
         "us_macro_nonfarm_payroll": {
             "name_cn": "美国非农就业",
             "description": "美国非农就业人数变化，月度劳动力市场核心指标",
@@ -148,7 +174,7 @@ class USStockFetcher(BaseFetcher):
         return {
             "category": "us_stock",
             "category_cn": "美股市场与美国宏观数据",
-            "description": "美股实时行情及美国16项核心宏观经济指标（非农、CPI、GDP等）",
+            "description": "美股实时行情（yfinance源）及美国16项核心宏观经济指标（非农、CPI、GDP等）",
             "data_sources": cls.DATA_CATALOG,
             "total_sources": len(cls.DATA_CATALOG),
         }
@@ -160,11 +186,11 @@ class USStockFetcher(BaseFetcher):
     def fetch_all(self) -> FetchSummary:
         results = []
 
-        # US Stock spot
+        # US Stock spot (yfinance)
         results.append(self._safe_fetch("us_stock_spot", self._fetch_us_spot))
         results.append(self._safe_fetch("us_famous_spot", self._fetch_us_famous_spot))
 
-        # US Macro (16 indicators, same as reference/us_macro/akshare_client.py)
+        # US Macro (16 indicators — akshare, unchanged)
         macro_apis = [
             ("us_macro_nonfarm_payroll", ak.macro_usa_non_farm),
             ("us_macro_unemployment", ak.macro_usa_unemployment_rate),
@@ -188,25 +214,79 @@ class USStockFetcher(BaseFetcher):
 
         return FetchSummary(category=self.category, results=results)
 
+    # ------------------------------------------------------------------
+    # yfinance helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _yf_to_row(sym, info, code=None):
+        """Convert a yfinance info dict into a row with Chinese column names."""
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
+        prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
+        change_pct = info.get("regularMarketChangePercent")
+        if change_pct is None and price and prev and prev != 0:
+            change_pct = round((price - prev) / prev * 100, 2)
+        return {
+            "代码": code or sym,
+            "名称": info.get("shortName", ""),
+            "最新价": price,
+            "涨跌幅": change_pct,
+            "涨跌额": round(price - prev, 2) if price and prev else None,
+            "成交量": info.get("volume"),
+            "成交额": (info.get("volume") or 0) * (price or 0),
+            "总市值": info.get("marketCap"),
+            "最高": info.get("dayHigh"),
+            "最低": info.get("dayLow"),
+            "今开": info.get("open") or info.get("regularMarketOpen"),
+            "昨收": prev,
+        }
+
+    def _fetch_yf_batch(self, symbols, code_map=None):
+        """Fetch a batch of tickers via yfinance in parallel threads."""
+        import yfinance as yf
+
+        rows = []
+
+        def _fetch_one(sym):
+            try:
+                t = yf.Ticker(sym)
+                info = t.info
+                if not info or not info.get("regularMarketPrice"):
+                    return None
+                code = code_map.get(sym, sym) if code_map else sym
+                return self._yf_to_row(sym, info, code=code)
+            except Exception as e:
+                self.logger.warning(f"yfinance fetch failed for {sym}: {e}")
+                return None
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {executor.submit(_fetch_one, sym): sym for sym in symbols}
+            for future in as_completed(futures):
+                row = future.result()
+                if row:
+                    rows.append(row)
+
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+    # ------------------------------------------------------------------
+    # Fetch methods
+    # ------------------------------------------------------------------
+
     def _fetch_us_spot(self):
-        """Fetch all US stock spot data."""
-        df = ak.stock_us_spot_em()
-        return df
+        """Fetch US large-cap spot data via yfinance."""
+        return self._fetch_yf_batch(_ALL_US_TICKERS)
 
     def _fetch_us_famous_spot(self):
-        """Fetch famous US stocks across categories.
+        """Fetch famous US stocks across categories via yfinance.
 
-        Merges 科技类/金融类/医药食品类/媒体类 into one DataFrame.
+        Merges 科技类/金融类/医药食品类/媒体类 into one DataFrame with 类别 column.
         """
-        import pandas as pd
-        dfs = []
-        for category in self.US_FAMOUS_CATEGORIES:
-            try:
-                df = ak.stock_us_famous_spot_em(symbol=category)
+        all_rows = []
+        for category, symbols in _US_FAMOUS_STOCKS.items():
+            df = self._fetch_yf_batch(symbols)
+            if not df.empty:
                 df["类别"] = category
-                dfs.append(df)
-            except Exception as e:
-                self.logger.warning(f"Failed to fetch us_famous {category}: {e}")
-        if dfs:
-            return pd.concat(dfs, ignore_index=True)
+                all_rows.append(df)
+        if all_rows:
+            return pd.concat(all_rows, ignore_index=True)
         return pd.DataFrame()

@@ -141,6 +141,16 @@ export class FundDataFetchStack extends Stack {
       lambdaEnv
     );
 
+    const histKlineFetchLambda = this.createDockerLambda(
+      "HistKlineFetchLambda",
+      lambdaDir,
+      "hist-kline-fetcher/Dockerfile",
+      "Fetch historical K-line data (A-share/HK/US) via yfinance",
+      2048,
+      15,
+      lambdaEnv
+    );
+
     const dataProcessorLambda = this.createDockerLambda(
       "DataProcessorLambda",
       lambdaDir,
@@ -169,6 +179,7 @@ export class FundDataFetchStack extends Stack {
       aShareFetchLambda,
       hkStockFetchLambda,
       usStockFetchLambda,
+      histKlineFetchLambda,
       dataProcessorLambda,
       catalogLambda,
     ].forEach((fn) => this.bucket.grantReadWrite(fn));
@@ -299,6 +310,25 @@ export class FundDataFetchStack extends Stack {
       )
     );
 
+    // Historical K-line fetch branch
+    parallelCollection.branch(
+      new tasks.LambdaInvoke(this, "InvokeHistKlineFetch", {
+        lambdaFunction: histKlineFetchLambda,
+        retryOnServiceExceptions: true,
+        payloadResponseOnly: true,
+        comment: "Historical K-line data (9 sources: 3 markets x 3 frequencies)",
+      }).addCatch(
+        new sfn.Pass(this, "HistKlineFetchFailed", {
+          result: sfn.Result.fromObject({
+            downloader: "hist-kline",
+            success: false,
+            error: "Lambda invocation failed",
+          }),
+        }),
+        { errors: ["States.ALL"], resultPath: "$" }
+      )
+    );
+
     // Data processor step (sequential after parallel, before catalog)
     // Passes minimal trigger event — processor reads parquet directly from S3
     const dataProcessorStep = new tasks.LambdaInvoke(
@@ -370,7 +400,7 @@ export class FundDataFetchStack extends Stack {
           includeExecutionData: true,
         },
         comment:
-          "Orchestrates parallel data collection (fund, CN index, CN macro, A-share, HK stock, US stock+macro), data processing, and catalog generation",
+          "Orchestrates parallel data collection (fund, CN index, CN macro, A-share, HK stock, US stock+macro, hist K-line), data processing, and catalog generation",
       }
     );
 

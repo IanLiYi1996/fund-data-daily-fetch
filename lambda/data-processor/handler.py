@@ -15,6 +15,7 @@ from shared.processors import (
     USProcessor,
     MacroProcessor,
     MarketOverviewProcessor,
+    HistKlineProcessor,
 )
 
 logger = get_logger(__name__)
@@ -27,6 +28,7 @@ PROCESSORS = [
     HKProcessor,
     USProcessor,
     MacroProcessor,
+    HistKlineProcessor,
 ]
 
 
