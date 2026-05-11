@@ -55,7 +55,15 @@ from typing import Optional
 import boto3
 import pandas as pd
 
-sys.path.insert(0, "lambda")
+# Allow import of `shared.*` whether we run inside the Docker image
+# (where shared/ is at /app/shared/) or from the repo root locally
+# (where shared/ is at lambda/shared/).
+_here = Path(__file__).resolve().parent
+for _candidate in (_here.parent, _here / "..", Path("lambda")):
+    _candidate = _candidate.resolve()
+    if (_candidate / "shared").is_dir() and str(_candidate) not in sys.path:
+        sys.path.insert(0, str(_candidate))
+        break
 from shared.storage.iceberg_writer import IcebergWriter  # noqa: E402
 
 
