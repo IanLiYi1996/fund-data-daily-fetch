@@ -221,6 +221,7 @@ export class FundDataFetchStack extends Stack {
       hkStockFetchLambda,
       usStockFetchLambda,
       histKlineFetchLambda,
+      catalogLambda,
     ].forEach((fn) => fn.addToRolePolicy(icebergGluePolicy));
 
     // ========== Iceberg Maintenance Lambda ==========
@@ -247,6 +248,7 @@ export class FundDataFetchStack extends Stack {
       usStockFetchLambda,
       histKlineFetchLambda,
       icebergMaintenanceLambda,
+      catalogLambda,
     ];
     icebergClients.forEach((fn) => fn.node.addDependency(glueDatabase));
 
