@@ -31,13 +31,13 @@ def daterange(start: date, end: date):
         cur += timedelta(days=1)
 
 
-def backfill_table(s3, writer, bucket: str, table_name: str,
+def backfill_table(s3, writer, bucket: str, s3_prefix: str, table_name: str,
                    start: date, end: date) -> dict:
     spec = TABLES[table_name]
     n_files, n_rows_inserted, n_rows_updated, n_failures = 0, 0, 0, 0
 
     for d in daterange(start, end):
-        key = f"{spec.source_category}/{d.isoformat()}/{table_name}.parquet"
+        key = f"{s3_prefix}{spec.source_category}/{d.isoformat()}/{table_name}.parquet"
         try:
             obj = s3.get_object(Bucket=bucket, Key=key)
         except s3.exceptions.NoSuchKey:
@@ -66,6 +66,8 @@ def backfill_table(s3, writer, bucket: str, table_name: str,
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--bucket", required=True)
+    p.add_argument("--s3-prefix", default="fund-data-pipeline/",
+                   help="Key prefix under the bucket (default: fund-data-pipeline/)")
     p.add_argument("--region", default="us-east-1")
     p.add_argument("--database", default="fund_data_lake")
     p.add_argument("--start", help="YYYY-MM-DD", default="2025-01-01")
@@ -76,9 +78,14 @@ def main() -> int:
     g.add_argument("--all", action="store_true")
     args = p.parse_args()
 
+    s3_prefix = args.s3_prefix
+    if s3_prefix and not s3_prefix.endswith("/"):
+        s3_prefix += "/"
+
     s3 = boto3.client("s3", region_name=args.region)
     writer = IcebergWriter.from_glue(
-        database=args.database, warehouse=f"s3://{args.bucket}/iceberg/"
+        database=args.database,
+        warehouse=f"s3://{args.bucket}/{s3_prefix}iceberg/",
     )
 
     start = date.fromisoformat(args.start)
@@ -88,7 +95,7 @@ def main() -> int:
     summaries = []
     for t in targets:
         print(f"\n=== {t} ===")
-        summary = backfill_table(s3, writer, args.bucket, t, start, end)
+        summary = backfill_table(s3, writer, args.bucket, s3_prefix, t, start, end)
         summaries.append(summary)
         print(f"summary: {summary}")
 

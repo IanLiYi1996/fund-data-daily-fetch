@@ -112,14 +112,14 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             from shared.storage.iceberg_writer import IcebergWriter
             writer = IcebergWriter.from_glue(
                 database="fund_data_lake",
-                warehouse=f"s3://{config.s3_bucket}/iceberg/",
+                warehouse=f"s3://{config.s3_bucket}/{config.s3_prefix}iceberg/",
             )
             mismatches = []
             for tname, spec in TABLES.items():
                 # Only check tables likely to have data written today (upsert-mode).
                 if spec.write_mode != "upsert":
                     continue
-                raw_key = f"{spec.source_category}/{date_str}/{tname}.parquet"
+                raw_key = f"{config.s3_prefix}{spec.source_category}/{date_str}/{tname}.parquet"
                 try:
                     head = s3_client.s3_client.head_object(
                         Bucket=config.s3_bucket, Key=raw_key

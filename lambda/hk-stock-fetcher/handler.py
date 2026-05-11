@@ -22,7 +22,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         config = Config.from_env()
         config.validate()
         s3_client = S3Client(config.s3_bucket)
-        warehouse = f"s3://{config.s3_bucket}/iceberg/"
+        warehouse = f"s3://{config.s3_bucket}/{config.s3_prefix}iceberg/"
         iceberg = IcebergWriter.from_glue(database="fund_data_lake", warehouse=warehouse)
         fetch_date = datetime.now()
 

@@ -21,9 +21,14 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--bucket", help="S3 bucket for warehouse")
+    p.add_argument("--s3-prefix", default="fund-data-pipeline/",
+                   help="Key prefix under the bucket (default: fund-data-pipeline/)")
     p.add_argument("--region", default="us-east-1")
     p.add_argument("--database", default="fund_data_lake")
     args = p.parse_args()
+    s3_prefix = args.s3_prefix
+    if s3_prefix and not s3_prefix.endswith("/"):
+        s3_prefix += "/"
 
     if args.dry_run == args.apply:
         p.error("specify exactly one of --dry-run or --apply")
@@ -45,7 +50,7 @@ def main() -> int:
     from shared.storage.iceberg_writer import IcebergWriter
     writer = IcebergWriter.from_glue(
         database=args.database,
-        warehouse=f"s3://{args.bucket}/iceberg/",
+        warehouse=f"s3://{args.bucket}/{s3_prefix}iceberg/",
     )
     existing_namespaces = [n[0] for n in writer.catalog.list_namespaces()]
     if args.database not in existing_namespaces:

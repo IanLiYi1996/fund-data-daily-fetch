@@ -24,10 +24,12 @@ import * as path from "path";
 
 export interface FundDataFetchStackProps extends StackProps {
   alertEmail?: string;
+  bucketName?: string;
+  s3Prefix?: string;
 }
 
 export class FundDataFetchStack extends Stack {
-  public readonly bucket: s3.Bucket;
+  public readonly bucket: s3.IBucket;
   public readonly stateMachine: sfn.StateMachine;
 
   constructor(scope: Construct, id: string, props?: FundDataFetchStackProps) {
@@ -35,43 +37,12 @@ export class FundDataFetchStack extends Stack {
 
     const lambdaDir = path.join(__dirname, "../../lambda");
 
-    // ========== S3 Bucket ==========
+    // ========== S3 Bucket (existing, shared with investment-advisory) ==========
 
-    this.bucket = new s3.Bucket(this, "FundDataBucket", {
-      bucketName: `fund-data-${this.account}-${this.region}`,
-      versioned: true,
-      removalPolicy: RemovalPolicy.RETAIN,
-      autoDeleteObjects: false,
-      encryption: s3.BucketEncryption.S3_MANAGED,
-      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-      lifecycleRules: [
-        {
-          id: "IntelligentTiering",
-          enabled: true,
-          transitions: [
-            {
-              storageClass: s3.StorageClass.INTELLIGENT_TIERING,
-              transitionAfter: Duration.days(30),
-            },
-          ],
-        },
-        {
-          id: "GlacierArchive",
-          enabled: true,
-          transitions: [
-            {
-              storageClass: s3.StorageClass.GLACIER,
-              transitionAfter: Duration.days(90),
-            },
-          ],
-        },
-        {
-          id: "DeleteOldVersions",
-          enabled: true,
-          noncurrentVersionExpiration: Duration.days(365),
-        },
-      ],
-    });
+    const bucketName =
+      props?.bucketName ?? `fsi-investmentadvisory-data-${this.account}-${this.region}`;
+    const s3Prefix = props?.s3Prefix ?? "fund-data-pipeline/";
+    this.bucket = s3.Bucket.fromBucketName(this, "FundDataBucket", bucketName);
 
     // ========== Glue Catalog ==========
     const FUND_DATA_LAKE_DB = "fund_data_lake";
@@ -83,10 +54,11 @@ export class FundDataFetchStack extends Stack {
     // ========== Lambda Environment ==========
 
     const lambdaEnv = {
-      S3_BUCKET: this.bucket.bucketName,
+      S3_BUCKET: bucketName,
+      S3_PREFIX: s3Prefix,
       LOG_LEVEL: "INFO",
       PYTHONUNBUFFERED: "1",
-      WAREHOUSE_PATH: `s3://${this.bucket.bucketName}/iceberg/`,
+      WAREHOUSE_PATH: `s3://${bucketName}/${s3Prefix}iceberg/`,
     };
 
     // ========== Lambda Functions ==========
@@ -181,7 +153,23 @@ export class FundDataFetchStack extends Stack {
       lambdaEnv
     );
 
-    // Grant S3 access to all Lambdas
+    // Grant S3 access scoped to {bucket}/{s3Prefix}* (not the whole shared bucket).
+    const listBucketPolicy = new iam.PolicyStatement({
+      actions: ["s3:ListBucket", "s3:GetBucketLocation"],
+      resources: [this.bucket.bucketArn],
+      conditions: {
+        StringLike: { "s3:prefix": [`${s3Prefix}*`] },
+      },
+    });
+    const objectPolicy = new iam.PolicyStatement({
+      actions: [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload",
+      ],
+      resources: [`${this.bucket.bucketArn}/${s3Prefix}*`],
+    });
     [
       fundFetchLambda,
       cnIndexFetchLambda,
@@ -192,7 +180,10 @@ export class FundDataFetchStack extends Stack {
       histKlineFetchLambda,
       dataProcessorLambda,
       catalogLambda,
-    ].forEach((fn) => this.bucket.grantReadWrite(fn));
+    ].forEach((fn) => {
+      fn.addToRolePolicy(listBucketPolicy);
+      fn.addToRolePolicy(objectPolicy);
+    });
 
     // ========== Iceberg / Glue IAM Policy ==========
 
@@ -235,7 +226,8 @@ export class FundDataFetchStack extends Stack {
       14,
       lambdaEnv
     );
-    this.bucket.grantReadWrite(icebergMaintenanceLambda);
+    icebergMaintenanceLambda.addToRolePolicy(listBucketPolicy);
+    icebergMaintenanceLambda.addToRolePolicy(objectPolicy);
     icebergMaintenanceLambda.addToRolePolicy(icebergGluePolicy);
 
     // Ensure all Iceberg-writing Lambdas are created after the Glue DB.
@@ -580,6 +572,12 @@ export class FundDataFetchStack extends Stack {
       value: this.bucket.bucketName,
       description: "S3 bucket name for fund data",
       exportName: "FundDataBucketName",
+    });
+
+    new CfnOutput(this, "S3Prefix", {
+      value: s3Prefix,
+      description: "S3 key prefix for fund data pipeline",
+      exportName: "FundDataS3Prefix",
     });
 
     new CfnOutput(this, "StateMachineArn", {

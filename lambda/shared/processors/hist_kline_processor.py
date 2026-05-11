@@ -68,7 +68,7 @@ class HistKlineProcessor(BaseProcessor):
         stats = {"written": 0, "skipped": 0, "errors": []}
 
         # List all daily parquet files for this market
-        prefix = f"hist_kline/{self.date_str}/{market}/daily/"
+        prefix = f"{self.key_prefix}hist_kline/{self.date_str}/{market}/daily/"
         stock_keys = self._list_parquet_keys(prefix)
 
         if not stock_keys:
@@ -167,7 +167,7 @@ class HistKlineProcessor(BaseProcessor):
             df[f"VOL_MA{p}"] = self.ti.sma(volume, p)
 
         # ── Write enriched parquet to S3 ─────────────────────────────
-        output_key = f"hist_kline_indicators/{self.date_str}/{market}/{code}.parquet"
+        output_key = f"{self.key_prefix}hist_kline_indicators/{self.date_str}/{market}/{code}.parquet"
         self._write_parquet(df, output_key)
         return "written"
 

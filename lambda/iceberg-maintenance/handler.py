@@ -46,7 +46,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info(f"Iceberg maintenance starting. Event: {event}")
     config = Config.from_env()
     config.validate()
-    warehouse = f"s3://{config.s3_bucket}/iceberg/"
+    warehouse = f"s3://{config.s3_bucket}/{config.s3_prefix}iceberg/"
     writer = IcebergWriter.from_glue(database="fund_data_lake", warehouse=warehouse)
     summary = run_maintenance(writer.catalog, "fund_data_lake")
     elapsed = (datetime.now() - start).total_seconds()
