@@ -84,6 +84,12 @@ class IcebergWriter:
         if df is None or df.empty:
             return {"skipped": True, "reason": "empty"}
 
+        if table_name not in TABLES:
+            self.logger.debug(
+                f"{table_name}: not registered in Iceberg TABLES; skipping"
+            )
+            return {"skipped": True, "reason": "not_registered"}
+
         spec = TABLES[table_name]
 
         # 1. Rename Chinese columns to canonical names (best-effort)
