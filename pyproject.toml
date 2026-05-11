@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "Fund data daily fetch with Iceberg lakehouse"
 requires-python = ">=3.11"
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=8.0",
     "pytest-mock>=3.12",
     "moto[s3,glue]>=5.0",

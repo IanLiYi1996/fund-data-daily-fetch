@@ -1,8 +1,6 @@
 """Shared pytest fixtures for fund-data-daily-fetch tests."""
 from __future__ import annotations
 
-import os
-import tempfile
 from pathlib import Path
 from typing import Iterator
 
