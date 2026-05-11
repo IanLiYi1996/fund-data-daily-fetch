@@ -1,4 +1,5 @@
-"""Lambda handler for fund data fetch."""
+"""Lambda handler for fund data fetch (dual-write: raw parquet + Iceberg)."""
+from __future__ import annotations
 
 import json
 from datetime import datetime
@@ -8,15 +9,12 @@ from shared.utils.config import Config
 from shared.utils.logger import get_logger
 from shared.fetchers import FundFetcher
 from shared.storage import S3Client
+from shared.storage.iceberg_writer import IcebergWriter
 
 logger = get_logger(__name__)
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """Fetch fund data and upload to S3.
-
-    Returns standardized response for Step Functions orchestration.
-    """
     start_time = datetime.now()
     logger.info(f"Starting fund data fetch. Event: {json.dumps(event, default=str)}")
 
@@ -24,36 +22,44 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         config = Config.from_env()
         config.validate()
         s3_client = S3Client(config.s3_bucket)
+        warehouse = f"s3://{config.s3_bucket}/iceberg/"
+        iceberg = IcebergWriter.from_glue(database="fund_data_lake", warehouse=warehouse)
         fetch_date = datetime.now()
 
         fetcher = FundFetcher()
         summary = fetcher.fetch_all()
 
-        # Upload results to S3
-        uploads = []
-        errors = []
+        uploads: list[dict] = []
+        errors: list[dict] = []
+        iceberg_summaries: list[dict] = []
+
         for result in summary.results:
-            if result.success and result.data is not None and not result.data.empty:
-                try:
-                    upload_info = s3_client.upload_dataframe(
-                        df=result.data,
-                        category=summary.category,
-                        data_name=result.name,
-                        date=fetch_date,
-                    )
-                    uploads.append({
-                        "name": result.name,
-                        "rows": result.row_count,
-                        "s3_key": upload_info.get("key"),
-                        "size": upload_info.get("size"),
-                    })
-                except Exception as e:
-                    errors.append({"name": result.name, "error": f"Upload failed: {str(e)}"})
-            elif not result.success:
-                errors.append({"name": result.name, "error": result.error})
+            out = fetcher.dual_write(
+                result, s3_client, iceberg,
+                category=summary.category, date=fetch_date,
+            )
+            if out.get("skipped"):
+                if not result.success:
+                    errors.append({"name": result.name, "error": result.error})
+                continue
+            raw_out = out["raw"] or {}
+            iceberg_out = out["iceberg"] or {}
+            if "error" in raw_out:
+                errors.append({"name": result.name, "error": f"raw: {raw_out['error']}"})
+            else:
+                uploads.append({
+                    "name": result.name, "rows": result.row_count,
+                    "s3_key": raw_out.get("key"), "size": raw_out.get("size"),
+                })
+            if "error" in iceberg_out:
+                errors.append({"name": result.name, "error": f"iceberg: {iceberg_out['error']}"})
+            iceberg_summaries.append({"name": result.name, **iceberg_out})
 
         elapsed = (datetime.now() - start_time).total_seconds()
-        logger.info(f"Fund fetch completed: {len(uploads)} uploads, {len(errors)} errors in {elapsed:.2f}s")
+        logger.info(
+            f"Fund fetch completed: {len(uploads)} uploads, {len(errors)} errors "
+            f"in {elapsed:.2f}s"
+        )
 
         return {
             "statusCode": 200,
@@ -63,6 +69,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "error_count": len(errors),
             "total_rows": sum(u["rows"] for u in uploads),
             "uploads": uploads,
+            "iceberg": iceberg_summaries,
             "errors": errors,
             "elapsed_seconds": round(elapsed, 2),
             "timestamp": datetime.now().isoformat(),
@@ -71,12 +78,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     except Exception as e:
         elapsed = (datetime.now() - start_time).total_seconds()
-        logger.error(f"Fund fetch failed: {e}")
+        logger.exception("Fund fetch failed")
         return {
-            "statusCode": 500,
-            "downloader": "fund",
-            "success": False,
-            "error": str(e),
-            "elapsed_seconds": round(elapsed, 2),
+            "statusCode": 500, "downloader": "fund", "success": False,
+            "error": str(e), "elapsed_seconds": round(elapsed, 2),
             "timestamp": datetime.now().isoformat(),
         }

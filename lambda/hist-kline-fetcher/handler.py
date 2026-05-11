@@ -1,5 +1,9 @@
 """Lambda handler for historical K-line data fetch."""
 
+# NOTE: Iceberg dual-write is intentionally deferred for hist-kline.
+# Per-stock filename routing to kline_a/hk/us tables needs a batching layer —
+# see spec M7/follow-up. Raw parquet continues as source of truth.
+
 import json
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
