@@ -94,43 +94,59 @@ _DATE_PREFIX_COL_RE = __import__("re").compile(
 )
 
 
+_PLACEHOLDER_VALUES: frozenset = frozenset({"", "---", "--", "-", "nan", "NaN", "None"})
+
+
+def _col_has_real_values(series) -> bool:
+    """True if the series has any non-placeholder value."""
+    if series is None or len(series) == 0:
+        return False
+    # Fast path: count non-placeholder rows
+    s = series.astype(str)
+    mask = ~s.isin(_PLACEHOLDER_VALUES)
+    return bool(mask.any())
+
+
 def _strip_date_prefix_keep_latest(df: "pd.DataFrame") -> "pd.DataFrame":
     """Collapse akshare's "YYYY-MM-DD-单位净值" columns to bare "单位净值".
 
     Several akshare endpoints (fund_open_fund_daily_em, fund_etf_fund_daily_em,
     fund_money_fund_daily_em, fund_graded_fund_daily_em) return today's and
-    yesterday's snapshots as PARALLEL columns like:
-        基金代码 | 基金简称 | 2026-05-08-单位净值 | 2026-05-08-累计净值
-                             | 2026-05-07-单位净值 | 2026-05-07-累计净值
-    We want the latest date for each metric so _AKSHARE_TO_CANONICAL's
-    plain mapping (单位净值 → unit_nav) takes effect.
+    yesterday's snapshots as PARALLEL columns:
+        基金代码 | 基金简称 | 2026-05-11-单位净值 | 2026-05-08-单位净值
+    The LATEST date often holds placeholders ('---', empty) until market
+    close; earlier dates are populated. So for each metric we pick the
+    column with the most-recent date that ALSO has real (non-placeholder)
+    values, falling back to newest if all are empty.
     """
     if df is None or df.empty:
         return df
-    # Find all prefixed columns grouped by metric, keep the max date per metric.
-    latest: dict[str, tuple[str, str]] = {}  # metric → (date, original_col)
-    plain_cols = []
+    # Group all prefixed columns by metric → list[(date, col)] sorted desc by date
+    by_metric: dict[str, list[tuple[str, str]]] = {}
     for col in df.columns:
         m = _DATE_PREFIX_COL_RE.match(str(col))
         if m is None:
-            plain_cols.append(col)
             continue
-        date_str = m.group(1)
-        metric = m.group("metric")
-        prev = latest.get(metric)
-        if prev is None or date_str > prev[0]:
-            latest[metric] = (date_str, col)
-    if not latest:
+        by_metric.setdefault(m.group("metric"), []).append((m.group(1), col))
+    if not by_metric:
         return df
-    # Build rename map: original → metric (only for the kept latest ones)
-    rename = {orig: metric for metric, (_, orig) in latest.items()}
-    # Drop older prefixed columns entirely
+
+    keep: dict[str, str] = {}  # metric → original col to keep
+    for metric, dated_cols in by_metric.items():
+        dated_cols.sort(key=lambda x: x[0], reverse=True)  # newest first
+        chosen = dated_cols[0][1]  # default: newest date
+        for _, col in dated_cols:
+            if _col_has_real_values(df[col]):
+                chosen = col
+                break
+        keep[metric] = chosen
+
+    rename = {orig: metric for metric, orig in keep.items()}
     drop_cols = [
         c for c in df.columns
         if _DATE_PREFIX_COL_RE.match(str(c)) and c not in rename
     ]
-    out = df.drop(columns=drop_cols).rename(columns=rename)
-    return out
+    return df.drop(columns=drop_cols).rename(columns=rename)
 
 
 class IcebergWriter:
