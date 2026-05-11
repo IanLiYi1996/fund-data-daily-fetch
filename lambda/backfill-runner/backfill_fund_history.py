@@ -280,9 +280,10 @@ def main() -> int:
     # 3. Initialize writer (shared across batches)
     warehouse = f"s3://{args.bucket}/{args.s3_prefix}iceberg/"
     writer = IcebergWriter.from_glue(database=args.database, warehouse=warehouse)
-    # We're running in-process from a dev/EC2 shell, not Lambda — turn off
-    # subprocess mode so we skip fork overhead per batch.
-    writer.subprocess_mode = False
+    # Keep subprocess_mode=True (default from from_glue): fund_daily is in
+    # _KNOWN_SIGSEGV_TABLES and will hang without subprocess isolation in the
+    # Fargate environment (confirmed empirically — smoke task hung on the
+    # final flush for 18+ minutes until manually stopped).
 
     # 4. Fetch + batch-upsert loop
     buffer: list[pd.DataFrame] = []
