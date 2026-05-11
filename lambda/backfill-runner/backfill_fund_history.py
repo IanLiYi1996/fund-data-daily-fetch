@@ -74,6 +74,22 @@ DEFAULT_BUCKET = "fsi-investmentadvisory-data-463470973226-us-east-1"
 DEFAULT_S3_PREFIX = "fund-data-pipeline/"
 DEFAULT_PROGRESS = Path.home() / ".cache" / "fund_backfill_progress.json"
 
+_S3_URI_PREFIX = "s3://"
+
+
+def _is_s3_uri(value) -> bool:
+    """True when value is an 's3://...' string (not a Path, not None)."""
+    return isinstance(value, str) and value.startswith(_S3_URI_PREFIX)
+
+
+def _s3_parse(uri: str) -> tuple[str, str]:
+    """Split an s3://bucket/key URI into (bucket, key)."""
+    without_scheme = uri[len(_S3_URI_PREFIX):]
+    bucket, _, key = without_scheme.partition("/")
+    if not bucket or not key:
+        raise ValueError(f"Invalid S3 URI: {uri!r}")
+    return bucket, key
+
 
 @dataclass
 class Progress:
@@ -82,26 +98,53 @@ class Progress:
     started_at: str
 
     @classmethod
-    def load(cls, path: Path) -> "Progress":
-        if path.exists():
-            raw = json.loads(path.read_text())
-            return cls(
-                done=set(raw.get("done", [])),
-                failed=dict(raw.get("failed", {})),
-                started_at=raw.get("started_at", datetime.now().isoformat()),
-            )
-        return cls(done=set(), failed={}, started_at=datetime.now().isoformat())
+    def load(cls, path) -> "Progress":
+        """Load progress from local path OR s3:// URI. Missing target → empty."""
+        if _is_s3_uri(path):
+            import boto3
+            bucket, key = _s3_parse(path)
+            s3 = boto3.client("s3")
+            try:
+                body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+            except s3.exceptions.NoSuchKey:
+                return cls(done=set(), failed={},
+                           started_at=datetime.now().isoformat())
+            raw = json.loads(body)
+        else:
+            p = Path(path)
+            if not p.exists():
+                return cls(done=set(), failed={},
+                           started_at=datetime.now().isoformat())
+            raw = json.loads(p.read_text())
+        return cls(
+            done=set(raw.get("done", [])),
+            failed=dict(raw.get("failed", {})),
+            started_at=raw.get("started_at", datetime.now().isoformat()),
+        )
 
-    def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
+    def save(self, path) -> None:
+        """Save to local path OR s3:// URI."""
+        body = json.dumps({
             "done": sorted(self.done),
             "failed": self.failed,
             "started_at": self.started_at,
             "updated_at": datetime.now().isoformat(),
             "total_done": len(self.done),
             "total_failed": len(self.failed),
-        }, ensure_ascii=False, indent=2))
+        }, ensure_ascii=False, indent=2)
+
+        if _is_s3_uri(path):
+            import boto3
+            bucket, key = _s3_parse(path)
+            boto3.client("s3").put_object(
+                Bucket=bucket, Key=key,
+                Body=body.encode("utf-8"),
+                ContentType="application/json; charset=utf-8",
+            )
+        else:
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body)
 
 
 def load_fund_codes(bucket: str, s3_prefix: str,
@@ -182,8 +225,12 @@ def main() -> int:
     p.add_argument("--s3-prefix", default=DEFAULT_S3_PREFIX)
     p.add_argument("--region", default="us-east-1")
     p.add_argument("--database", default="fund_data_lake")
-    p.add_argument("--progress-file", type=Path, default=DEFAULT_PROGRESS,
-                   help="Path to resume checkpoint JSON")
+    prog_group = p.add_mutually_exclusive_group()
+    prog_group.add_argument("--progress-file", type=Path, default=None,
+                            help="Local filesystem checkpoint path")
+    prog_group.add_argument("--progress-s3", type=str, default=None,
+                            help="s3://bucket/key checkpoint URI (takes "
+                                 "precedence over --progress-file)")
     p.add_argument("--workers", type=int, default=4,
                    help="Parallel akshare fetcher threads")
     p.add_argument("--batch-size", type=int, default=100,
@@ -200,9 +247,13 @@ def main() -> int:
                    help="Delete checkpoint file before starting")
     args = p.parse_args()
 
-    if args.reset_progress and args.progress_file.exists():
-        args.progress_file.unlink()
-        print(f"Deleted progress file: {args.progress_file}")
+    progress_target = args.progress_s3 if args.progress_s3 else (
+        args.progress_file if args.progress_file else DEFAULT_PROGRESS
+    )
+
+    if args.reset_progress and not _is_s3_uri(progress_target) and Path(progress_target).exists():
+        Path(progress_target).unlink()
+        print(f"Deleted progress file: {progress_target}")
 
     # 1. Resolve fund list
     if args.codes:
@@ -212,7 +263,7 @@ def main() -> int:
         pairs = load_fund_codes(args.bucket, args.s3_prefix, args.region)
 
     # 2. Load progress + filter
-    progress = Progress.load(args.progress_file)
+    progress = Progress.load(progress_target)
     print(f"Progress: {len(progress.done)} already done, "
           f"{len(progress.failed)} previously failed")
     todo = [(c, n) for c, n in pairs if c not in progress.done]
@@ -264,14 +315,14 @@ def main() -> int:
             if len(buffer) >= args.batch_size:
                 flush_batch(writer, buffer, f"[{n_processed}/{len(todo)}]")
                 buffer = []
-                progress.save(args.progress_file)
+                progress.save(progress_target)
                 eta_s = (time.time() - t_start) / n_processed * (len(todo) - n_processed)
                 print(f"  progress saved. ETA ~{eta_s/60:.1f} min")
 
     # Final flush
     if buffer:
         flush_batch(writer, buffer, "[final]")
-    progress.save(args.progress_file)
+    progress.save(progress_target)
 
     elapsed = time.time() - t_start
     print(f"\n=== Done ===")
@@ -279,7 +330,7 @@ def main() -> int:
     print(f"Empty:     {n_empty}")
     print(f"Failed:    {len(progress.failed)}")
     print(f"Elapsed:   {elapsed:.0f}s ({elapsed/60:.1f} min)")
-    print(f"Progress file: {args.progress_file}")
+    print(f"Progress target: {progress_target}")
     return 0 if not progress.failed else 1
 
 
