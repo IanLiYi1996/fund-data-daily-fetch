@@ -342,7 +342,9 @@ class FundFetcher(BaseFetcher):
                        if c in wide.columns]
         if not rating_cols:
             return wide
-        id_cols = [c for c in ("代码", "简称") if c in wide.columns]
+        # akshare fund_rating_all returns 代码 + 简称 (not 基金代码/基金简称)
+        id_cols = [c for c in ("代码", "简称", "基金代码", "基金简称")
+                   if c in wide.columns]
         long_df = wide.melt(
             id_vars=id_cols,
             value_vars=rating_cols,

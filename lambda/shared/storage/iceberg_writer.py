@@ -27,9 +27,13 @@ _AKSHARE_TO_CANONICAL: dict[str, str] = {
     "基金简称": "fund_name",
     "基金名称": "fund_name",
     "名称": "fund_name",
+    "简称": "fund_name",
     "单位净值": "unit_nav",
     "累计净值": "accum_nav",
+    # daily return has at least 3 akshare aliases in different endpoints
     "日增长率": "daily_return_pct",
+    "日涨幅": "daily_return_pct",
+    "增长率": "daily_return_pct",
     "申购状态": "subscription_status",
     "赎回状态": "redemption_status",
     "手续费": "fee",
@@ -39,15 +43,27 @@ _AKSHARE_TO_CANONICAL: dict[str, str] = {
     "成交额": "turnover",
     "市价": "market_price",
     "折溢价率": "premium_pct",
+    "折价率": "premium_pct",
     "万份收益": "ten_thousand_yield",
     "7日年化": "annual_yield_7d",
+    "年化收益率7日": "annual_yield_7d",
     "估算净值": "estimated_nav",
     "估算涨跌幅": "estimated_change_pct",
     "近1周": "weekly_return",
     "近1月": "monthly_return",
     "近1年": "yearly_return",
+    # fund_dividend → akshare returns 分红 / 权益登记日 / 除息日期 / 分红发放日
     "分红金额": "dividend_amount",
+    "分红": "dividend_amount",
+    "除息日": "event_date",
+    "除息日期": "event_date",
+    "发放日": "payment_date",
+    "分红发放日": "payment_date",
+    # fund_split → akshare returns 拆分折算 / 拆分折算日
     "拆分比例": "split_ratio",
+    "拆分折算": "split_ratio",
+    "拆分日期": "event_date",
+    "拆分折算日": "event_date",
     "持仓代码": "holding_code",
     "持仓名称": "holding_name",
     "占净值比例": "weight_pct",
@@ -58,7 +74,9 @@ _AKSHARE_TO_CANONICAL: dict[str, str] = {
     "姓名": "manager_name",
     "所属公司": "company",
     "管理规模": "aum",
+    "现任基金资产总规模": "aum",
     "任职回报": "tenure_return",
+    "现任基金最佳回报": "tenure_return",
     "评级机构": "rating_agency",
     "评级": "rating",
     "基金类型": "fund_type",
@@ -66,6 +84,52 @@ _AKSHARE_TO_CANONICAL: dict[str, str] = {
     "日期": "trade_date",
     "开盘": "open", "最高": "high", "最低": "low", "收盘": "close",
 }
+
+
+# Regex: matches akshare "YYYY-MM-DD-<metric>" or "YYYY-MM-DD--<metric>"
+# column names (e.g. "2026-05-08-单位净值", "2026-05-07--累计净值").
+_DATE_PREFIX_COL_RE = __import__("re").compile(
+    r"^(\d{4}-\d{2}-\d{2})-+(?P<metric>.+)$"
+)
+
+
+def _strip_date_prefix_keep_latest(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Collapse akshare's "YYYY-MM-DD-单位净值" columns to bare "单位净值".
+
+    Several akshare endpoints (fund_open_fund_daily_em, fund_etf_fund_daily_em,
+    fund_money_fund_daily_em, fund_graded_fund_daily_em) return today's and
+    yesterday's snapshots as PARALLEL columns like:
+        基金代码 | 基金简称 | 2026-05-08-单位净值 | 2026-05-08-累计净值
+                             | 2026-05-07-单位净值 | 2026-05-07-累计净值
+    We want the latest date for each metric so _AKSHARE_TO_CANONICAL's
+    plain mapping (单位净值 → unit_nav) takes effect.
+    """
+    if df is None or df.empty:
+        return df
+    # Find all prefixed columns grouped by metric, keep the max date per metric.
+    latest: dict[str, tuple[str, str]] = {}  # metric → (date, original_col)
+    plain_cols = []
+    for col in df.columns:
+        m = _DATE_PREFIX_COL_RE.match(str(col))
+        if m is None:
+            plain_cols.append(col)
+            continue
+        date_str = m.group(1)
+        metric = m.group("metric")
+        prev = latest.get(metric)
+        if prev is None or date_str > prev[0]:
+            latest[metric] = (date_str, col)
+    if not latest:
+        return df
+    # Build rename map: original → metric (only for the kept latest ones)
+    rename = {orig: metric for metric, (_, orig) in latest.items()}
+    # Drop older prefixed columns entirely
+    drop_cols = [
+        c for c in df.columns
+        if _DATE_PREFIX_COL_RE.match(str(c)) and c not in rename
+    ]
+    out = df.drop(columns=drop_cols).rename(columns=rename)
+    return out
 
 
 class IcebergWriter:
@@ -256,8 +320,13 @@ class IcebergWriter:
 
         spec = TABLES[table_name]
 
-        # 1. Rename Chinese columns to canonical names (best-effort)
-        renamed = df.rename(columns=_AKSHARE_TO_CANONICAL)
+        # 1a. Collapse akshare's "YYYY-MM-DD-metric" columns to bare "metric"
+        # (keeping only the latest date per metric). Affects daily-NAV
+        # endpoints that return today + yesterday side by side.
+        pre = _strip_date_prefix_keep_latest(df)
+
+        # 1b. Rename Chinese columns to canonical names (best-effort)
+        renamed = pre.rename(columns=_AKSHARE_TO_CANONICAL)
 
         # 2. Normalize date columns (renames + coerces dtype, drops bad rows)
         from datetime import datetime as _dt, date as _date
