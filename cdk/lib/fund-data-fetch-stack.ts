@@ -11,6 +11,8 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
+import * as glue from "aws-cdk-lib/aws-glue";
+import * as iam from "aws-cdk-lib/aws-iam";
 import * as sns from "aws-cdk-lib/aws-sns";
 import * as subscriptions from "aws-cdk-lib/aws-sns-subscriptions";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
@@ -71,12 +73,19 @@ export class FundDataFetchStack extends Stack {
       ],
     });
 
+    // ========== Glue Catalog ==========
+    const glueDatabase = new glue.CfnDatabase(this, "FundDataLakeDb", {
+      catalogId: this.account,
+      databaseInput: { name: "fund_data_lake" },
+    });
+
     // ========== Lambda Environment ==========
 
     const lambdaEnv = {
       S3_BUCKET: this.bucket.bucketName,
       LOG_LEVEL: "INFO",
       PYTHONUNBUFFERED: "1",
+      WAREHOUSE_PATH: `s3://${this.bucket.bucketName}/iceberg/`,
     };
 
     // ========== Lambda Functions ==========
@@ -183,6 +192,49 @@ export class FundDataFetchStack extends Stack {
       dataProcessorLambda,
       catalogLambda,
     ].forEach((fn) => this.bucket.grantReadWrite(fn));
+
+    // ========== Iceberg / Glue IAM Policy ==========
+
+    const icebergGluePolicy = new iam.PolicyStatement({
+      actions: [
+        "glue:GetDatabase",
+        "glue:GetDatabases",
+        "glue:GetTable",
+        "glue:GetTables",
+        "glue:CreateTable",
+        "glue:UpdateTable",
+        "glue:DeleteTable",
+      ],
+      resources: [
+        `arn:aws:glue:${this.region}:${this.account}:catalog`,
+        `arn:aws:glue:${this.region}:${this.account}:database/fund_data_lake`,
+        `arn:aws:glue:${this.region}:${this.account}:table/fund_data_lake/*`,
+      ],
+    });
+
+    [
+      fundFetchLambda,
+      cnIndexFetchLambda,
+      cnMacroFetchLambda,
+      aShareFetchLambda,
+      hkStockFetchLambda,
+      usStockFetchLambda,
+      histKlineFetchLambda,
+    ].forEach((fn) => fn.addToRolePolicy(icebergGluePolicy));
+
+    // ========== Iceberg Maintenance Lambda ==========
+
+    const icebergMaintenanceLambda = this.createDockerLambda(
+      "IcebergMaintenanceLambda",
+      lambdaDir,
+      "iceberg-maintenance/Dockerfile",
+      "Weekly Iceberg compaction + snapshot expiration",
+      3008,
+      14,
+      lambdaEnv
+    );
+    this.bucket.grantReadWrite(icebergMaintenanceLambda);
+    icebergMaintenanceLambda.addToRolePolicy(icebergGluePolicy);
 
     // ========== Step Functions ==========
 
@@ -428,6 +480,19 @@ export class FundDataFetchStack extends Stack {
       })
     );
 
+    const weeklyMaintenanceRule = new events.Rule(this, "WeeklyMaintenanceRule", {
+      ruleName: "FundDataLakeWeeklyMaintenance",
+      description: "Weekly Iceberg compaction + snapshot expiration (Sunday 20:00 UTC)",
+      schedule: events.Schedule.cron({
+        minute: "0",
+        hour: "20",
+        weekDay: "SUN",
+      }),
+    });
+    weeklyMaintenanceRule.addTarget(
+      new targets.LambdaFunction(icebergMaintenanceLambda)
+    );
+
     // ========== SNS Topic ==========
 
     const alertTopic = new sns.Topic(this, "FundDataFetchAlertTopic", {
@@ -523,6 +588,12 @@ export class FundDataFetchStack extends Stack {
       value: scheduleRule.ruleArn,
       description: "EventBridge schedule rule ARN",
       exportName: "FundDataFetchScheduleRuleArn",
+    });
+
+    new CfnOutput(this, "GlueDatabaseName", {
+      value: "fund_data_lake",
+      description: "Glue database for Iceberg tables",
+      exportName: "FundDataLakeGlueDb",
     });
   }
 
