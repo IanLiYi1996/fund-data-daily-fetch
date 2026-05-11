@@ -46,6 +46,7 @@ _AKSHARE_TO_CANONICAL: dict[str, str] = {
     "折价率": "premium_pct",
     "万份收益": "ten_thousand_yield",
     "7日年化": "annual_yield_7d",
+    "7日年化%": "annual_yield_7d",
     "年化收益率7日": "annual_yield_7d",
     "估算净值": "estimated_nav",
     "估算涨跌幅": "estimated_change_pct",
@@ -355,17 +356,20 @@ class IcebergWriter:
         projected = normalized[keep_cols].copy()
 
         # 4b. Coerce numeric columns: akshare often emits '' or '---' as
-        # placeholders for missing values, which break pyarrow.cast to double.
-        # Use pd.to_numeric(errors='coerce') so placeholders become NaN.
+        # placeholders for missing values, or tacks on '%' for percentages
+        # (e.g. '0.01%', '-0.02%'). Strip '%' and use pd.to_numeric with
+        # errors='coerce' so placeholders become NaN.
         from pyiceberg.types import DoubleType, FloatType, IntegerType, LongType
         numeric_iceberg_types = (DoubleType, FloatType, IntegerType, LongType)
         for field in spec.schema.fields:
             if field.name in projected.columns and isinstance(
                 field.field_type, numeric_iceberg_types
             ):
-                projected[field.name] = pd.to_numeric(
-                    projected[field.name], errors="coerce"
-                )
+                col = projected[field.name]
+                if col.dtype == object:
+                    # Strip '%' suffix on string values before numeric coerce
+                    col = col.astype(str).str.rstrip("%")
+                projected[field.name] = pd.to_numeric(col, errors="coerce")
 
         # 4c. Pad missing (nullable) schema columns with None so the Arrow
         # table always has EXACTLY the target schema's field set in the same
