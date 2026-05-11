@@ -300,7 +300,7 @@ class IcebergWriter:
             cmd.append("--force-append")
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=300,
+                cmd, capture_output=True, text=True, timeout=900,
             )
         except subprocess.TimeoutExpired:
             return {"error": "subprocess timeout (>300s)", "rows_inserted": 0}

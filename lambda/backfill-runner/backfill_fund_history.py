@@ -206,14 +206,21 @@ def flush_batch(
     buffer: list[pd.DataFrame],
     logger_prefix: str,
 ) -> dict:
-    """Concatenate buffered DataFrames and upsert into fund_daily."""
+    """Concatenate buffered DataFrames and append into fund_daily.
+
+    Backfill data is pure history (no concurrent updates to merge), and
+    fund_daily's upsert path hits pyiceberg-core SIGSEGV. Bypass both
+    upsert and the subprocess wrapper — call _write_inline directly with
+    force_append=True so each batch finishes in seconds rather than
+    timing out the 900s subprocess limit.
+    """
     if not buffer:
         return {"skipped": True}
     combined = pd.concat(buffer, ignore_index=True)
     print(f"  {logger_prefix} flushing {len(buffer)} funds, "
-          f"{len(combined)} rows → fund_daily...")
+          f"{len(combined)} rows → fund_daily (force_append)...")
     t0 = time.time()
-    result = writer.write("fund_daily", combined)
+    result = writer._write_inline("fund_daily", combined, force_append=True)
     elapsed = time.time() - t0
     print(f"  {logger_prefix} wrote in {elapsed:.1f}s: {result}")
     return result
@@ -277,13 +284,15 @@ def main() -> int:
             print(f"  {c} {n}")
         return 0
 
-    # 3. Initialize writer (shared across batches)
+    # 3. Initialize writer (shared across batches).
+    # We bypass subprocess mode because flush_batch calls _write_inline
+    # directly with force_append=True (see docstring there). Eagerly load
+    # the Glue catalog here so the first batch's flush doesn't pay the
+    # catalog-init latency while holding the buffer.
     warehouse = f"s3://{args.bucket}/{args.s3_prefix}iceberg/"
     writer = IcebergWriter.from_glue(database=args.database, warehouse=warehouse)
-    # Keep subprocess_mode=True (default from from_glue): fund_daily is in
-    # _KNOWN_SIGSEGV_TABLES and will hang without subprocess isolation in the
-    # Fargate environment (confirmed empirically — smoke task hung on the
-    # final flush for 18+ minutes until manually stopped).
+    writer.subprocess_mode = False
+    writer._load_catalog()  # prime the Glue client
 
     # 4. Fetch + batch-upsert loop
     buffer: list[pd.DataFrame] = []
