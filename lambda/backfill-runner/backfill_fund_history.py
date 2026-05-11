@@ -23,21 +23,24 @@ Prerequisites:
 - AWS credentials with S3 + Glue write on the fund-data-pipeline prefix
 - Local akshare install (in dev deps)
 
-Usage:
+Usage (local from repo root):
     # Dry run: print what would be done, don't actually fetch/write
-    uv run python scripts/backfill_fund_history.py --dry-run --limit 5
+    ./scripts/backfill_fund_history_local.sh --dry-run --limit 5
 
     # Backfill 10 funds (for a smoke test)
-    uv run python scripts/backfill_fund_history.py --limit 10
+    ./scripts/backfill_fund_history_local.sh --limit 10
 
     # Full backfill (takes ~4-8 hours for 20k funds depending on network)
-    uv run python scripts/backfill_fund_history.py
+    ./scripts/backfill_fund_history_local.sh
 
     # Resume with different batch size / more workers
-    uv run python scripts/backfill_fund_history.py --workers 8 --batch-size 200
+    ./scripts/backfill_fund_history_local.sh --workers 8 --batch-size 200
 
     # Only backfill specific codes (useful for single-fund testing)
-    uv run python scripts/backfill_fund_history.py --codes 000001,110022
+    ./scripts/backfill_fund_history_local.sh --codes 000001,110022
+
+Usage (on Fargate or any other runtime, direct python invocation):
+    uv run python lambda/backfill-runner/backfill_fund_history.py --limit 5 ...
 """
 from __future__ import annotations
 
