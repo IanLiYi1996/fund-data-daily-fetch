@@ -378,7 +378,7 @@ class IcebergWriter:
                 field.field_type, numeric_iceberg_types
             ):
                 col = projected[field.name]
-                if col.dtype == object:
+                if pd.api.types.is_string_dtype(col) or col.dtype == object:
                     # Strip '%' suffix on string values before numeric coerce
                     col = col.astype(str).str.rstrip("%")
                 projected[field.name] = pd.to_numeric(col, errors="coerce")
