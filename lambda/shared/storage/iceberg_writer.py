@@ -79,8 +79,20 @@ class IcebergWriter:
         )
         return cls(catalog=catalog, database=database)
 
-    def write(self, table_name: str, df: pd.DataFrame) -> dict[str, Any]:
-        """Normalize, ensure table exists, then upsert/append per spec."""
+    def write(
+        self,
+        table_name: str,
+        df: pd.DataFrame,
+        fetch_date=None,
+    ) -> dict[str, Any]:
+        """Normalize, ensure table exists, then upsert/append per spec.
+
+        ``fetch_date`` (a ``date`` or ``datetime``) is used as the fallback
+        for partition date columns when the upstream DataFrame does not
+        include the date (common for akshare snapshot endpoints like
+        ``fund_open_fund_daily_em`` that return "today's values" with no
+        date column).
+        """
         if df is None or df.empty:
             return {"skipped": True, "reason": "empty"}
 
@@ -96,8 +108,12 @@ class IcebergWriter:
         renamed = df.rename(columns=_AKSHARE_TO_CANONICAL)
 
         # 2. Normalize date columns (renames + coerces dtype, drops bad rows)
+        from datetime import datetime as _dt, date as _date
+        fallback = fetch_date
+        if isinstance(fallback, _dt):
+            fallback = fallback.date()
         try:
-            normalized = normalize(renamed, spec.date_specs)
+            normalized = normalize(renamed, spec.date_specs, fallback_date=fallback)
         except KeyError as e:
             self.logger.error(f"{table_name}: missing required date column - {e}")
             return {"error": str(e), "rows_inserted": 0}

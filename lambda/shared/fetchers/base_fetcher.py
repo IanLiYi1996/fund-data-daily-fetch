@@ -102,7 +102,10 @@ class BaseFetcher(ABC):
         # 2. Iceberg write (errors isolated; never fail the whole fetch)
         iceberg_out: dict[str, Any]
         try:
-            iceberg_out = iceberg_writer.write(result.name, result.data)
+            iceberg_out = iceberg_writer.write(
+                result.name, result.data,
+                fetch_date=upload_kwargs.get("date"),
+            )
         except Exception as e:
             self.logger.error(f"{result.name}: iceberg write failed - {e}")
             iceberg_out = {"error": str(e)}

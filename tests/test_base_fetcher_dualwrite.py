@@ -40,7 +40,7 @@ def test_dual_write_both_succeed(fetcher, df):
     assert out["raw"]["rows"] == 2
     assert out["iceberg"]["rows_inserted"] == 2
     s3.upload_dataframe.assert_called_once()
-    iceberg.write.assert_called_once_with("fund_daily", df)
+    iceberg.write.assert_called_once_with("fund_daily", df, fetch_date=None)
 
 
 def test_iceberg_failure_does_not_block_raw(fetcher, df):

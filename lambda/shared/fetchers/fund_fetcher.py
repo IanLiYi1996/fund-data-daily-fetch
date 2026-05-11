@@ -261,11 +261,10 @@ class FundFetcher(BaseFetcher):
         results.append(self._safe_fetch("fund_index_info", self._fetch_fund_index_info))
         results.append(self._safe_fetch("fund_graded_daily", self._fetch_fund_graded_daily))
 
-        # ===== Priority 5: Closed / FOF / REITs / portfolio =====
-        results.append(self._safe_fetch("fund_close_daily", self._fetch_fund_close_daily))
-        results.append(self._safe_fetch("fund_fof_daily", self._fetch_fund_fof_daily))
+        # ===== Priority 5: REITs (closed/FOF deferred — akshare has no direct API) =====
+        # fund_close_daily and fund_fof_daily need per-code akshare APIs; skip until a
+        # fan-out design lands. fund_portfolio_hold is similarly quarterly per-fund.
         results.append(self._safe_fetch("fund_reits_daily", self._fetch_fund_reits_daily))
-        results.append(self._safe_fetch("fund_portfolio_hold", self._fetch_fund_portfolio_hold))
 
         return FetchSummary(category=self.category, results=results)
 
@@ -369,18 +368,23 @@ class FundFetcher(BaseFetcher):
         df = ak.fund_graded_fund_daily_em()
         return df
 
-    # === New: closed-end / REITs / FOF / portfolio_hold ===
+    # === New: REITs ===
+    # fund_close_em / fund_fof_em / public_fund_REITs do not exist in current
+    # akshare (1.18.x). Keeping _fetch_fund_close_daily / _fetch_fund_fof_daily
+    # / _fetch_fund_portfolio_hold as placeholders (returning empty) so the
+    # DATA_CATALOG catalog entries don't dangle if anyone re-enables them.
     def _fetch_fund_close_daily(self):
-        return ak.fund_close_em()
+        import pandas as pd
+        return pd.DataFrame()
 
     def _fetch_fund_fof_daily(self):
-        return ak.fund_fof_em()
+        import pandas as pd
+        return pd.DataFrame()
 
     def _fetch_fund_reits_daily(self):
-        return ak.public_fund_REITs()
+        # akshare 1.18: reits_realtime_em covers public REITs intraday prices.
+        return ak.reits_realtime_em()
 
     def _fetch_fund_portfolio_hold(self):
-        # Quarterly; per-fund fan-out would be needed for real coverage.
-        # Returning empty DataFrame until per-fund fan-out is designed.
         import pandas as pd
         return pd.DataFrame()
