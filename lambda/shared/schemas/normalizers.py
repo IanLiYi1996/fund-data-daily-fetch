@@ -1,8 +1,8 @@
 """Normalize akshare DataFrames into canonical Iceberg-friendly schemas."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import date, datetime
+from dataclasses import dataclass
+from datetime import date
 from typing import Iterable, Literal, Optional
 
 import pandas as pd
@@ -17,9 +17,6 @@ class DateColumnSpec:
     source_candidates: list[str]
     target: str
     dtype: DateDtype = "date"
-
-
-_DATE_FORMATS = ["%Y-%m-%d", "%Y%m%d", "%Y/%m/%d", "%Y/%m/%-d", "%Y-%m-%-d"]
 
 
 def coerce_date_column(s: pd.Series, dtype: DateDtype) -> pd.Series:
