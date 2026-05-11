@@ -174,6 +174,39 @@ class FundFetcher(BaseFetcher):
             "key_fields": ["基金代码", "基金简称", "单位净值", "折溢价率"],
             "has_fee_data": False,
         },
+        # Priority 5: Closed-end / REITs / FOF / portfolio
+        "fund_close_daily": {
+            "name_cn": "场内封闭式基金",
+            "description": "场内封闭式基金净值与折溢价",
+            "source_api": "fund_close_em",
+            "update_frequency": "daily",
+            "key_fields": ["基金代码", "基金简称", "最新价", "单位净值", "折溢价率"],
+            "has_fee_data": False,
+        },
+        "fund_fof_daily": {
+            "name_cn": "FOF 基金每日",
+            "description": "FOF 基金每日净值与收益",
+            "source_api": "fund_fof_em",
+            "update_frequency": "daily",
+            "key_fields": ["基金代码", "基金简称", "单位净值", "累计净值"],
+            "has_fee_data": False,
+        },
+        "fund_reits_daily": {
+            "name_cn": "公募 REITs",
+            "description": "公募 REITs 实时行情",
+            "source_api": "public_fund_REITs",
+            "update_frequency": "daily",
+            "key_fields": ["代码", "名称", "最新价", "涨跌幅"],
+            "has_fee_data": False,
+        },
+        "fund_portfolio_hold": {
+            "name_cn": "基金持仓明细",
+            "description": "基金季度报告持仓明细（低频）",
+            "source_api": "fund_portfolio_hold_em",
+            "update_frequency": "quarterly",
+            "key_fields": ["基金代码", "报告期", "持仓代码", "持仓名称", "占净值比例"],
+            "has_fee_data": False,
+        },
     }
 
     @classmethod
@@ -227,6 +260,12 @@ class FundFetcher(BaseFetcher):
         # ===== Priority 4: Index fund specific =====
         results.append(self._safe_fetch("fund_index_info", self._fetch_fund_index_info))
         results.append(self._safe_fetch("fund_graded_daily", self._fetch_fund_graded_daily))
+
+        # ===== Priority 5: Closed / FOF / REITs / portfolio =====
+        results.append(self._safe_fetch("fund_close_daily", self._fetch_fund_close_daily))
+        results.append(self._safe_fetch("fund_fof_daily", self._fetch_fund_fof_daily))
+        results.append(self._safe_fetch("fund_reits_daily", self._fetch_fund_reits_daily))
+        results.append(self._safe_fetch("fund_portfolio_hold", self._fetch_fund_portfolio_hold))
 
         return FetchSummary(category=self.category, results=results)
 
@@ -329,3 +368,19 @@ class FundFetcher(BaseFetcher):
     def _fetch_fund_graded_daily(self):
         df = ak.fund_graded_fund_daily_em()
         return df
+
+    # === New: closed-end / REITs / FOF / portfolio_hold ===
+    def _fetch_fund_close_daily(self):
+        return ak.fund_close_em()
+
+    def _fetch_fund_fof_daily(self):
+        return ak.fund_fof_em()
+
+    def _fetch_fund_reits_daily(self):
+        return ak.public_fund_REITs()
+
+    def _fetch_fund_portfolio_hold(self):
+        # Quarterly; per-fund fan-out would be needed for real coverage.
+        # Returning empty DataFrame until per-fund fan-out is designed.
+        import pandas as pd
+        return pd.DataFrame()
