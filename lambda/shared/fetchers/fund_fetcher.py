@@ -281,7 +281,15 @@ class FundFetcher(BaseFetcher):
         return df
 
     def _fetch_fund_manager(self):
+        import hashlib
         df = ak.fund_manager_em()
+        # akshare returns no stable manager id. Synthesize one as a 16-char
+        # hash of (name + company) so PK (manager_id, snapshot_date) is stable
+        # across days for the same manager.
+        if "姓名" in df.columns and "所属公司" in df.columns:
+            df["manager_id"] = (
+                df["姓名"].astype(str) + "|" + df["所属公司"].astype(str)
+            ).apply(lambda s: hashlib.sha1(s.encode("utf-8")).hexdigest()[:16])
         return df
 
     def _fetch_fund_daily(self):
@@ -325,8 +333,26 @@ class FundFetcher(BaseFetcher):
         return df
 
     def _fetch_fund_rating(self):
-        df = ak.fund_rating_all()
-        return df
+        import pandas as pd
+        wide = ak.fund_rating_all()
+        # akshare returns a wide frame (one row per fund with 4 rating-agency
+        # columns). The Iceberg schema is long (fund_code, snapshot_date,
+        # rating_agency) → rating. Melt here.
+        rating_cols = [c for c in ("上海证券", "招商证券", "济安金信", "晨星评级")
+                       if c in wide.columns]
+        if not rating_cols:
+            return wide
+        id_cols = [c for c in ("代码", "简称") if c in wide.columns]
+        long_df = wide.melt(
+            id_vars=id_cols,
+            value_vars=rating_cols,
+            var_name="rating_agency",
+            value_name="rating",
+        )
+        # Drop rows with missing rating and coerce to string (schema is String)
+        long_df = long_df.dropna(subset=["rating"])
+        long_df["rating"] = long_df["rating"].astype(str)
+        return long_df
 
     def _fetch_fund_dividend_rank(self):
         df = ak.fund_fh_rank_em()

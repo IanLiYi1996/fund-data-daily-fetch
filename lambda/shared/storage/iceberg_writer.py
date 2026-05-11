@@ -46,6 +46,7 @@ _AKSHARE_TO_CANONICAL: dict[str, str] = {
     "市值": "market_value",
     "基金经理": "manager_name",
     "基金经理ID": "manager_id",
+    "姓名": "manager_name",
     "所属公司": "company",
     "管理规模": "aum",
     "任职回报": "tenure_return",
@@ -131,7 +132,20 @@ class IcebergWriter:
         # 4. Project to schema columns (drop unknown extras to avoid evolve churn)
         schema_cols = [f.name for f in spec.schema.fields]
         keep_cols = [c for c in schema_cols if c in normalized.columns]
-        projected = normalized[keep_cols]
+        projected = normalized[keep_cols].copy()
+
+        # 4b. Coerce numeric columns: akshare often emits '' or '---' as
+        # placeholders for missing values, which break pyarrow.cast to double.
+        # Use pd.to_numeric(errors='coerce') so placeholders become NaN.
+        from pyiceberg.types import DoubleType, FloatType, IntegerType, LongType
+        numeric_iceberg_types = (DoubleType, FloatType, IntegerType, LongType)
+        for field in spec.schema.fields:
+            if field.name in projected.columns and isinstance(
+                field.field_type, numeric_iceberg_types
+            ):
+                projected[field.name] = pd.to_numeric(
+                    projected[field.name], errors="coerce"
+                )
 
         # 5. Build Arrow table aligned to Iceberg schema
         arrow_table = pa.Table.from_pandas(projected, preserve_index=False)
