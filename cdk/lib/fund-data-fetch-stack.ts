@@ -74,9 +74,10 @@ export class FundDataFetchStack extends Stack {
     });
 
     // ========== Glue Catalog ==========
+    const FUND_DATA_LAKE_DB = "fund_data_lake";
     const glueDatabase = new glue.CfnDatabase(this, "FundDataLakeDb", {
       catalogId: this.account,
-      databaseInput: { name: "fund_data_lake" },
+      databaseInput: { name: FUND_DATA_LAKE_DB },
     });
 
     // ========== Lambda Environment ==========
@@ -207,8 +208,8 @@ export class FundDataFetchStack extends Stack {
       ],
       resources: [
         `arn:aws:glue:${this.region}:${this.account}:catalog`,
-        `arn:aws:glue:${this.region}:${this.account}:database/fund_data_lake`,
-        `arn:aws:glue:${this.region}:${this.account}:table/fund_data_lake/*`,
+        `arn:aws:glue:${this.region}:${this.account}:database/${FUND_DATA_LAKE_DB}`,
+        `arn:aws:glue:${this.region}:${this.account}:table/${FUND_DATA_LAKE_DB}/*`,
       ],
     });
 
@@ -235,6 +236,19 @@ export class FundDataFetchStack extends Stack {
     );
     this.bucket.grantReadWrite(icebergMaintenanceLambda);
     icebergMaintenanceLambda.addToRolePolicy(icebergGluePolicy);
+
+    // Ensure all Iceberg-writing Lambdas are created after the Glue DB.
+    const icebergClients = [
+      fundFetchLambda,
+      cnIndexFetchLambda,
+      cnMacroFetchLambda,
+      aShareFetchLambda,
+      hkStockFetchLambda,
+      usStockFetchLambda,
+      histKlineFetchLambda,
+      icebergMaintenanceLambda,
+    ];
+    icebergClients.forEach((fn) => fn.node.addDependency(glueDatabase));
 
     // ========== Step Functions ==========
 
@@ -591,7 +605,7 @@ export class FundDataFetchStack extends Stack {
     });
 
     new CfnOutput(this, "GlueDatabaseName", {
-      value: "fund_data_lake",
+      value: FUND_DATA_LAKE_DB,
       description: "Glue database for Iceberg tables",
       exportName: "FundDataLakeGlueDb",
     });
