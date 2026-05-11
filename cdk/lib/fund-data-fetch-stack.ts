@@ -11,6 +11,8 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as events from "aws-cdk-lib/aws-events";
+import * as ec2 from "aws-cdk-lib/aws-ec2";
+import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as glue from "aws-cdk-lib/aws-glue";
 import * as iam from "aws-cdk-lib/aws-iam";
@@ -609,6 +611,86 @@ export class FundDataFetchStack extends Stack {
       value: FUND_DATA_LAKE_DB,
       description: "Glue database for Iceberg tables",
       exportName: "FundDataLakeGlueDb",
+    });
+
+    // ========== Fargate: one-shot history backfill ==========
+
+    const backfillVpc = ec2.Vpc.fromLookup(this, "BackfillDefaultVpc", {
+      isDefault: true,
+    });
+
+    const backfillCluster = new ecs.Cluster(this, "BackfillCluster", {
+      clusterName: "fund-data-backfill-cluster",
+      vpc: backfillVpc,
+      containerInsights: false,
+    });
+
+    const backfillImage = new ecrAssets.DockerImageAsset(
+      this,
+      "BackfillImage",
+      {
+        directory: lambdaDir,
+        file: "backfill-runner/Dockerfile",
+        platform: ecrAssets.Platform.LINUX_AMD64,
+      }
+    );
+
+    const backfillLogGroup = new logs.LogGroup(this, "BackfillLogs", {
+      logGroupName: "/aws/ecs/fund-history-backfill",
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+
+    const backfillTaskDef = new ecs.FargateTaskDefinition(
+      this,
+      "BackfillTaskDef",
+      {
+        cpu: 1024,
+        memoryLimitMiB: 2048,
+        family: "FundHistoryBackfill",
+      }
+    );
+
+    backfillTaskDef.addContainer("backfill", {
+      image: ecs.ContainerImage.fromDockerImageAsset(backfillImage),
+      command: [
+        "--progress-s3",
+        `s3://${bucketName}/${s3Prefix}_backfill/progress.json`,
+      ],
+      environment: {
+        S3_BUCKET: bucketName,
+        S3_PREFIX: s3Prefix,
+        WAREHOUSE_PATH: `s3://${bucketName}/${s3Prefix}iceberg/`,
+        AWS_REGION: this.region,
+      },
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: "backfill",
+        logGroup: backfillLogGroup,
+      }),
+    });
+
+    // Reuse the same S3 + Glue policy statements as the Lambda fetchers.
+    [listBucketPolicy, objectPolicy, icebergGluePolicy].forEach((stmt) =>
+      backfillTaskDef.taskRole.addToPrincipalPolicy(stmt)
+    );
+    backfillTaskDef.node.addDependency(glueDatabase);
+
+    new CfnOutput(this, "BackfillClusterName", {
+      value: backfillCluster.clusterName,
+      description: "ECS cluster for the one-shot backfill task",
+      exportName: "FundDataBackfillClusterName",
+    });
+
+    new CfnOutput(this, "BackfillTaskDefArn", {
+      value: backfillTaskDef.taskDefinitionArn,
+      description: "Fargate task definition for the backfill container",
+      exportName: "FundDataBackfillTaskDefArn",
+    });
+
+    new CfnOutput(this, "BackfillSubnetIds", {
+      value: backfillVpc.publicSubnets.map((s) => s.subnetId).join(","),
+      description: "Public subnets to run the Fargate task in",
+      exportName: "FundDataBackfillSubnetIds",
     });
   }
 
