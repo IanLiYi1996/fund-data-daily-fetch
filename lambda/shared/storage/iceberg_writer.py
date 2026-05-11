@@ -149,7 +149,12 @@ class IcebergWriter:
         df: pd.DataFrame,
         fetch_date,
     ) -> dict[str, Any]:
-        """Dump df to a tempfile, spawn a Python subprocess to do the write."""
+        """Dump df to a tempfile, spawn a Python subprocess to do the write.
+
+        On SIGSEGV (exitcode -11) — a known pyiceberg-core Rust bug on upsert
+        for certain tables — retry once in force-append mode so at least the
+        data lands. Downstream deduplication handles the resulting duplicates.
+        """
         from datetime import date, datetime
         fd_str = None
         if fetch_date is not None:
@@ -164,52 +169,73 @@ class IcebergWriter:
             tmp_path = f.name
         try:
             df.to_parquet(tmp_path, index=False, engine="pyarrow")
-            # Subprocess entry: ``python -m shared.storage.iceberg_writer``
-            cmd = [
-                sys.executable, "-m", "shared.storage.iceberg_writer",
-                "--table", table_name,
-                "--database", self.database,
-                "--warehouse", self.warehouse or "",
-                "--parquet", tmp_path,
-            ]
-            if fd_str:
-                cmd.extend(["--fetch-date", fd_str])
-            try:
-                proc = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=300,
+            result = self._run_subprocess(table_name, tmp_path, fd_str)
+            # pyiceberg-core SIGSEGV (-11) on upsert: retry in append mode
+            if result.get("error", "").endswith("exitcode=-11"):
+                self.logger.warning(
+                    f"{table_name}: upsert SIGSEGV, retrying as append"
                 )
-            except subprocess.TimeoutExpired:
-                return {"error": "subprocess timeout (>300s)", "rows_inserted": 0}
-
-            if proc.returncode != 0:
-                reason = f"subprocess exitcode={proc.returncode}"
-                stderr_tail = (proc.stderr or "").strip().splitlines()[-5:]
-                self.logger.error(
-                    f"{table_name}: iceberg subprocess failed ({reason}); "
-                    f"stderr tail: {stderr_tail}"
+                result = self._run_subprocess(
+                    table_name, tmp_path, fd_str, force_append=True,
                 )
-                return {"error": reason, "rows_inserted": 0,
-                        "stderr": "\n".join(stderr_tail)}
-            # Parse JSON from last non-empty stdout line
-            out = (proc.stdout or "").strip().splitlines()
-            if not out:
-                return {"error": "subprocess produced no output", "rows_inserted": 0}
-            try:
-                return json.loads(out[-1])
-            except json.JSONDecodeError as e:
-                return {"error": f"subprocess json decode failed: {e}",
-                        "stdout_tail": out[-5:], "rows_inserted": 0}
+                if "error" not in result:
+                    result["fallback"] = "append_after_sigsegv"
+            return result
         finally:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
 
+    def _run_subprocess(
+        self,
+        table_name: str,
+        tmp_path: str,
+        fd_str: Optional[str],
+        force_append: bool = False,
+    ) -> dict[str, Any]:
+        cmd = [
+            sys.executable, "-m", "shared.storage.iceberg_writer",
+            "--table", table_name,
+            "--database", self.database,
+            "--warehouse", self.warehouse or "",
+            "--parquet", tmp_path,
+        ]
+        if fd_str:
+            cmd.extend(["--fetch-date", fd_str])
+        if force_append:
+            cmd.append("--force-append")
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=300,
+            )
+        except subprocess.TimeoutExpired:
+            return {"error": "subprocess timeout (>300s)", "rows_inserted": 0}
+
+        if proc.returncode != 0:
+            reason = f"subprocess exitcode={proc.returncode}"
+            stderr_tail = (proc.stderr or "").strip().splitlines()[-5:]
+            self.logger.error(
+                f"{table_name}: iceberg subprocess failed ({reason}); "
+                f"stderr tail: {stderr_tail}"
+            )
+            return {"error": reason, "rows_inserted": 0,
+                    "stderr": "\n".join(stderr_tail)}
+        out = (proc.stdout or "").strip().splitlines()
+        if not out:
+            return {"error": "subprocess produced no output", "rows_inserted": 0}
+        try:
+            return json.loads(out[-1])
+        except json.JSONDecodeError as e:
+            return {"error": f"subprocess json decode failed: {e}",
+                    "stdout_tail": out[-5:], "rows_inserted": 0}
+
     def _write_inline(
         self,
         table_name: str,
         df: pd.DataFrame,
         fetch_date=None,
+        force_append: bool = False,
     ) -> dict[str, Any]:
         """Normalize, ensure table exists, then upsert/append per spec.
 
@@ -272,15 +298,21 @@ class IcebergWriter:
                     projected[field.name], errors="coerce"
                 )
 
+        # 4c. Pad missing (nullable) schema columns with None so the Arrow
+        # table always has EXACTLY the target schema's field set in the same
+        # order. pyiceberg.upsert() calls source_table.cast(target_schema)
+        # which requires strict field-name match; partial projections fail.
+        for field in spec.schema.fields:
+            if field.name not in projected.columns:
+                projected[field.name] = None
+        # Reorder to match schema field order exactly
+        projected = projected[schema_cols]
+
         # 5. Build Arrow table aligned to Iceberg schema
         arrow_table = pa.Table.from_pandas(projected, preserve_index=False)
         iceberg_arrow_schema = spec.schema.as_arrow()
         # Cast to align dtypes (e.g., Python date → Arrow date32)
-        arrow_table = arrow_table.cast(
-            pa.schema(
-                [iceberg_arrow_schema.field(c) for c in arrow_table.column_names]
-            )
-        )
+        arrow_table = arrow_table.cast(iceberg_arrow_schema)
 
         # 6. Ensure table exists
         catalog = self._load_catalog()
@@ -294,14 +326,14 @@ class IcebergWriter:
             )
         table = catalog.load_table(identifier)
 
-        # 7. Write per spec.write_mode
-        if spec.write_mode == "upsert":
+        # 7. Write per spec.write_mode (or force-append override)
+        if spec.write_mode == "upsert" and not force_append:
             result = table.upsert(arrow_table)
             return {
                 "rows_inserted": result.rows_inserted,
                 "rows_updated": result.rows_updated,
             }
-        else:  # append
+        else:
             table.append(arrow_table)
             return {"rows_appended": len(arrow_table)}
 
@@ -321,6 +353,8 @@ def _subprocess_main() -> int:
     p.add_argument("--warehouse", required=True)
     p.add_argument("--parquet", required=True, help="Path to input parquet")
     p.add_argument("--fetch-date", help="YYYY-MM-DD", default=None)
+    p.add_argument("--force-append", action="store_true",
+                   help="Force append mode (fallback after pyiceberg upsert SIGSEGV)")
     args = p.parse_args()
 
     df = pd.read_parquet(args.parquet, engine="pyarrow")
@@ -330,7 +364,9 @@ def _subprocess_main() -> int:
         catalog=None, database=args.database,
         warehouse=args.warehouse, subprocess_mode=False,
     )
-    result = writer._write_inline(args.table, df, fetch_date=fd)
+    result = writer._write_inline(
+        args.table, df, fetch_date=fd, force_append=args.force_append,
+    )
     # JSON-serialise numeric types (rows_inserted etc are already ints)
     print(json.dumps(result, default=str))
     return 0

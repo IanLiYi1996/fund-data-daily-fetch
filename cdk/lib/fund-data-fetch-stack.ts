@@ -4,6 +4,7 @@ import {
   Duration,
   RemovalPolicy,
   CfnOutput,
+  Size,
 } from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as s3 from "aws-cdk-lib/aws-s3";
@@ -630,6 +631,9 @@ export class FundDataFetchStack extends Stack {
       }),
       memorySize,
       timeout: Duration.minutes(timeoutMinutes),
+      // pyiceberg + pandas round-trip uses /tmp for parquet staging; 512 MB
+      // default fills up on 26k-row tables. 2 GB is plenty and cheap.
+      ephemeralStorageSize: Size.mebibytes(2048),
       environment,
       description,
     });
