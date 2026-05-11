@@ -49,7 +49,7 @@ import io
 import json
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -238,8 +238,8 @@ def main() -> int:
     prog_group.add_argument("--progress-s3", type=str, default=None,
                             help="s3://bucket/key checkpoint URI (takes "
                                  "precedence over --progress-file)")
-    p.add_argument("--workers", type=int, default=4,
-                   help="Parallel akshare fetcher threads")
+    p.add_argument("--workers", type=int, default=8,
+                   help="Parallel akshare fetcher processes")
     p.add_argument("--batch-size", type=int, default=100,
                    help="Concat this many funds before each Iceberg upsert")
     p.add_argument("--sleep", type=float, default=0.3,
@@ -300,7 +300,11 @@ def main() -> int:
     n_processed = 0
     n_empty = 0
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+    # ProcessPool instead of ThreadPool: akshare uses pyexecjs (Node.js
+    # subprocess) to eval returned JavaScript. Thread-based concurrency
+    # hits GIL + subprocess serialization. Processes scale near-linearly
+    # with vCPU count for this workload.
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futures = {
             pool.submit(fetch_one_fund, code, name, args.sleep): (code, name)
             for code, name in todo

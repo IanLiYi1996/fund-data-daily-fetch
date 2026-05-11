@@ -645,8 +645,8 @@ export class FundDataFetchStack extends Stack {
       this,
       "BackfillTaskDef",
       {
-        cpu: 1024,
-        memoryLimitMiB: 2048,
+        cpu: 2048,
+        memoryLimitMiB: 4096,
         family: "FundHistoryBackfill",
       }
     );
