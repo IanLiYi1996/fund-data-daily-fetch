@@ -189,6 +189,18 @@ class IcebergWriter:
         )
         return self.catalog
 
+    # Tables that have been observed to SIGSEGV in pyiceberg-core during
+    # upsert. Only these go through the subprocess isolation path in prod;
+    # everything else runs in-process for speed (subprocess fork+init is
+    # ~5s/table which pushes total fund-fetcher runtime past the Lambda
+    # 15-min hard limit).
+    _KNOWN_SIGSEGV_TABLES: frozenset = frozenset({
+        "fund_performance",
+        "fund_name",
+        "fund_daily",
+        "fund_value_estimation",
+    })
+
     def write(
         self,
         table_name: str,
@@ -197,14 +209,14 @@ class IcebergWriter:
     ) -> dict[str, Any]:
         """Write ``df`` to the Iceberg table ``table_name``.
 
-        In subprocess_mode this dispatches the real work to a child Python
-        process (isolation against pyiceberg-core segfaults). Otherwise it
-        runs inline.
+        Subprocess path is ONLY used for tables empirically known to
+        SIGSEGV in pyiceberg-core (see ``_KNOWN_SIGSEGV_TABLES``).
+        All others run in-process to stay within Lambda's 15-min timeout.
         """
         if df is None or df.empty:
             return {"skipped": True, "reason": "empty"}
 
-        if self.subprocess_mode:
+        if self.subprocess_mode and table_name in self._KNOWN_SIGSEGV_TABLES:
             return self._write_via_subprocess(table_name, df, fetch_date)
         return self._write_inline(table_name, df, fetch_date)
 
