@@ -156,6 +156,16 @@ export class FundDataFetchStack extends Stack {
       lambdaEnv
     );
 
+    const exportFundHistoryLambda = this.createDockerLambda(
+      "ExportFundHistoryLambda",
+      lambdaDir,
+      "export-fund-history/Dockerfile",
+      "Export current month's fund_daily to partitioned parquet for cross-account share",
+      2048,
+      10,
+      lambdaEnv
+    );
+
     // Grant S3 access scoped to {bucket}/{s3Prefix}* (not the whole shared bucket).
     const listBucketPolicy = new iam.PolicyStatement({
       actions: ["s3:ListBucket", "s3:GetBucketLocation"],
@@ -183,6 +193,7 @@ export class FundDataFetchStack extends Stack {
       histKlineFetchLambda,
       dataProcessorLambda,
       catalogLambda,
+      exportFundHistoryLambda,
     ].forEach((fn) => {
       fn.addToRolePolicy(listBucketPolicy);
       fn.addToRolePolicy(objectPolicy);
@@ -434,13 +445,43 @@ export class FundDataFetchStack extends Stack {
           action: "generate-catalog",
           processing: sfn.JsonPath.objectAt("$.processing"),
         }),
+        resultPath: "$.catalog",
       }
     );
 
-    // Define state machine: parallel collection → data processing → catalog
+    // Export current month's fund_daily to partitioned parquet for cross-account
+    // share with financial-dataset-mx (S3 Replication mirrors automatically).
+    // Failure here should not fail the whole pipeline — it only affects the
+    // downstream share, not the primary Iceberg data.
+    const exportFundHistoryStep = new tasks.LambdaInvoke(
+      this,
+      "InvokeExportFundHistory",
+      {
+        lambdaFunction: exportFundHistoryLambda,
+        retryOnServiceExceptions: true,
+        payloadResponseOnly: true,
+        comment: "Export current month fund_daily parquet for cross-account share",
+        payload: sfn.TaskInput.fromObject({}),
+        resultPath: "$.export_fund_history",
+      }
+    ).addCatch(
+      new sfn.Pass(this, "ExportFundHistoryFailed", {
+        result: sfn.Result.fromObject({
+          downloader: "export-fund-history",
+          success: false,
+          error: "Export fund history Lambda failed",
+        }),
+        resultPath: "$.export_fund_history",
+      }),
+      { errors: ["States.ALL"] }
+    );
+
+    // Define state machine:
+    //   parallel collection → data processing → catalog → export fund_history
     const definition = parallelCollection
       .next(dataProcessorStep)
-      .next(catalogStep);
+      .next(catalogStep)
+      .next(exportFundHistoryStep);
 
     // Step Functions log group
     const sfnLogGroup = new logs.LogGroup(this, "DataCollectionWorkflowLogs", {
