@@ -166,6 +166,16 @@ export class FundDataFetchStack extends Stack {
       lambdaEnv
     );
 
+    const fundHistoryFetchLambda = this.createDockerLambda(
+      "FundHistoryFetchLambda",
+      lambdaDir,
+      "fund-history-fetcher/Dockerfile",
+      "Fetch per-fund manager tenure + scale history (one partition or merge)",
+      3008,
+      15,
+      lambdaEnv
+    );
+
     // Grant S3 access scoped to {bucket}/{s3Prefix}* (not the whole shared bucket).
     const listBucketPolicy = new iam.PolicyStatement({
       actions: ["s3:ListBucket", "s3:GetBucketLocation"],
@@ -194,6 +204,7 @@ export class FundDataFetchStack extends Stack {
       dataProcessorLambda,
       catalogLambda,
       exportFundHistoryLambda,
+      fundHistoryFetchLambda,
     ].forEach((fn) => {
       fn.addToRolePolicy(listBucketPolicy);
       fn.addToRolePolicy(objectPolicy);
@@ -545,6 +556,161 @@ export class FundDataFetchStack extends Stack {
       new targets.LambdaFunction(icebergMaintenanceLambda)
     );
 
+    // ========== Fund History Step Functions (partitioned fanout + merge) ==========
+    //
+    // 25k funds × 2 sources can't fit in one 15 min Lambda. We fan out into
+    // FUND_HISTORY_PARTITIONS partitions via a Map state, each writing
+    // fund_*_history__part{i}.parquet, then run a merge step that concats
+    // the parts into a single fund_*_history.parquet and deletes the parts.
+
+    const FUND_HISTORY_PARTITIONS = 4;
+
+    const partitionTask = new tasks.LambdaInvoke(
+      this,
+      "InvokeFundHistoryPartition",
+      {
+        lambdaFunction: fundHistoryFetchLambda,
+        retryOnServiceExceptions: true,
+        payloadResponseOnly: true,
+        comment: "Fetch one partition of fund history",
+      }
+    ).addCatch(
+      new sfn.Pass(this, "FundHistoryPartitionFailed", {
+        result: sfn.Result.fromObject({
+          downloader: "fund-history",
+          success: false,
+          error: "Lambda partition failed",
+        }),
+      }),
+      { errors: ["States.ALL"] }
+    );
+
+    const partitionMap = new sfn.Map(this, "FundHistoryPartitionMap", {
+      itemsPath: "$.partitions",
+      maxConcurrency: FUND_HISTORY_PARTITIONS,
+      resultPath: "$.partition_results",
+      comment: "Fan out fund-history fetch across partitions",
+    });
+    partitionMap.itemProcessor(partitionTask);
+
+    // After all partitions finish, merge per-part parquet files into a
+    // single fund_*_history.parquet so downstream consumers can read one file.
+    // snapshot_date intentionally omitted; merge Lambda defaults to UTC today,
+    // which is the same day the partitions just wrote to.
+    const mergeTask = new tasks.LambdaInvoke(this, "InvokeFundHistoryMerge", {
+      lambdaFunction: fundHistoryFetchLambda,
+      retryOnServiceExceptions: true,
+      payloadResponseOnly: true,
+      comment: "Merge per-partition parquet files into a single history file",
+      payload: sfn.TaskInput.fromObject({
+        mode: sfn.JsonPath.stringAt("$.merge_mode"),
+        partition_total: FUND_HISTORY_PARTITIONS,
+      }),
+      resultPath: "$.merge_result",
+    }).addCatch(
+      new sfn.Pass(this, "FundHistoryMergeFailed", {
+        result: sfn.Result.fromObject({
+          downloader: "fund-history-merge",
+          success: false,
+          error: "Merge Lambda failed",
+        }),
+        resultPath: "$.merge_result",
+      }),
+      { errors: ["States.ALL"] }
+    );
+
+    const fundHistoryDefinition = partitionMap.next(mergeTask);
+
+    const fundHistoryLogGroup = new logs.LogGroup(
+      this,
+      "FundHistoryWorkflowLogs",
+      {
+        logGroupName: "/aws/stepfunctions/FundHistoryWorkflow",
+        retention: logs.RetentionDays.TWO_WEEKS,
+        removalPolicy: RemovalPolicy.DESTROY,
+      }
+    );
+
+    const fundHistoryStateMachine = new sfn.StateMachine(
+      this,
+      "FundHistoryWorkflow",
+      {
+        stateMachineName: "FundHistoryFetchWorkflow",
+        definitionBody: sfn.DefinitionBody.fromChainable(fundHistoryDefinition),
+        timeout: Duration.minutes(60),
+        tracingEnabled: true,
+        logs: {
+          destination: fundHistoryLogGroup,
+          level: sfn.LogLevel.ALL,
+          includeExecutionData: true,
+        },
+        comment:
+          "Fan-out fetch of per-fund manager tenure + scale history across partitions, then merge into a single parquet",
+      }
+    );
+
+    // EventBridge input includes both per-partition Map items and top-level
+    // $.merge_mode the merge step reads.
+    const buildPartitionsInput = (mode: "manager_full" | "scale_full") => {
+      const merge_mode = mode === "manager_full" ? "manager_merge" : "scale_merge";
+      return events.RuleTargetInput.fromObject({
+        partitions: Array.from(
+          { length: FUND_HISTORY_PARTITIONS },
+          (_, i) => ({
+            mode,
+            partition_index: i,
+            partition_total: FUND_HISTORY_PARTITIONS,
+          })
+        ),
+        merge_mode,
+        triggered_by: `scheduled-${mode}`,
+      });
+    };
+
+    // Weekly: manager tenure full refresh — Sundays 18:00 UTC
+    const managerHistoryRule = new events.Rule(
+      this,
+      "FundManagerHistoryWeeklySchedule",
+      {
+        ruleName: "FundManagerHistoryWeeklySchedule",
+        description:
+          "Weekly full refresh of fund_manager_history (Sundays 18:00 UTC)",
+        schedule: events.Schedule.cron({
+          minute: "0",
+          hour: "18",
+          weekDay: "SUN",
+        }),
+      }
+    );
+    managerHistoryRule.addTarget(
+      new targets.SfnStateMachine(fundHistoryStateMachine, {
+        input: buildPartitionsInput("manager_full"),
+      })
+    );
+
+    // Quarterly: scale history full refresh — Jan/Apr/Jul/Oct 4th at 19:00 UTC
+    // (3-day buffer after quarter end so most fund-of-quarter data is published)
+    const scaleHistoryRule = new events.Rule(
+      this,
+      "FundScaleHistoryQuarterlySchedule",
+      {
+        ruleName: "FundScaleHistoryQuarterlySchedule",
+        description:
+          "Quarterly full refresh of fund_scale_history (Jan/Apr/Jul/Oct 4th 19:00 UTC)",
+        schedule: events.Schedule.cron({
+          minute: "0",
+          hour: "19",
+          day: "4",
+          month: "1,4,7,10",
+        }),
+      }
+    );
+    scaleHistoryRule.addTarget(
+      new targets.SfnStateMachine(fundHistoryStateMachine, {
+        input: buildPartitionsInput("scale_full"),
+      })
+    );
+
     // ========== SNS Topic ==========
 
     const alertTopic = new sns.Topic(this, "FundDataFetchAlertTopic", {
@@ -610,6 +776,30 @@ export class FundDataFetchStack extends Stack {
       new cloudwatchActions.SnsAction(alertTopic)
     );
 
+    // Fund history workflow failure alarm
+    const fundHistoryFailureAlarm = new cloudwatch.Alarm(
+      this,
+      "FundHistoryWorkflowFailedAlarm",
+      {
+        alarmName: "FundHistoryWorkflowFailed",
+        alarmDescription:
+          "Alarm when the fund-history fetch workflow fails",
+        metric: fundHistoryStateMachine.metricFailed({
+          period: Duration.minutes(15),
+          statistic: "Sum",
+        }),
+        threshold: 1,
+        evaluationPeriods: 1,
+        comparisonOperator:
+          cloudwatch.ComparisonOperator
+            .GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }
+    );
+    fundHistoryFailureAlarm.addAlarmAction(
+      new cloudwatchActions.SnsAction(alertTopic)
+    );
+
     // ========== Outputs ==========
 
     new CfnOutput(this, "BucketName", {
@@ -652,6 +842,12 @@ export class FundDataFetchStack extends Stack {
       value: FUND_DATA_LAKE_DB,
       description: "Glue database for Iceberg tables",
       exportName: "FundDataLakeGlueDb",
+    });
+
+    new CfnOutput(this, "FundHistoryWorkflowArn", {
+      value: fundHistoryStateMachine.stateMachineArn,
+      description: "Fund history fetch Step Functions ARN",
+      exportName: "FundHistoryWorkflowArn",
     });
 
     // ========== Fargate: one-shot history backfill ==========
