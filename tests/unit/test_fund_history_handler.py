@@ -68,7 +68,9 @@ def test_slice_partition_handles_uneven_division(handler_module):
     assert len(flat) == 10
 
 
-def test_handler_manager_full_mode_invokes_fetcher_and_uploads(handler_module):
+def test_handler_manager_full_writes_to_staging_path(handler_module):
+    """Partition output goes to _history_staging/ (NOT replicated to mengxin),
+    so transient half-written part files never reach the consumer side."""
     df = pd.DataFrame([{
         "基金代码": "000001", "经理姓名": "张三",
         "起始日": dt.date(2024, 1, 1), "结束日": pd.NaT,
@@ -77,7 +79,7 @@ def test_handler_manager_full_mode_invokes_fetcher_and_uploads(handler_module):
     }])
     fetcher = _make_fetcher_stub(manager_df=df)
     s3 = MagicMock()
-    s3.upload_dataframe.return_value = {"key": "fund/2026-05-14/fund_manager_history__part0.parquet", "size": 1234}
+    s3.upload_dataframe.return_value = {"key": "_history_staging/fund_manager_history__part0.parquet", "size": 1234}
 
     result = handler_module.run(
         event={"mode": "manager_full", "fund_codes": ["000001", "000002"],
@@ -87,8 +89,16 @@ def test_handler_manager_full_mode_invokes_fetcher_and_uploads(handler_module):
 
     fetcher.fetch_manager_history.assert_called_once()
     args, kwargs = fetcher.fetch_manager_history.call_args
-    assert args[0] == ["000001", "000002"]  # codes passed through
+    assert args[0] == ["000001", "000002"]
+    # Must upload to staging category (not "fund"), so replication rule
+    # filters skip these per-partition intermediate files.
     s3.upload_dataframe.assert_called_once()
+    upload_kwargs = s3.upload_dataframe.call_args.kwargs
+    assert upload_kwargs["category"] == "_history_staging"
+    assert upload_kwargs["data_name"] == "fund_manager_history__part0"
+    # date= must be None so the path has no date partition; we want a single
+    # canonical staging slot per part, not one per day.
+    assert upload_kwargs.get("date") is None
     assert result["success"] is True
     assert result["mode"] == "manager_full"
     assert result["partition_index"] == 0
@@ -106,7 +116,7 @@ def test_handler_scale_full_mode_invokes_scale_fetcher(handler_module):
     }])
     fetcher = _make_fetcher_stub(scale_df=df)
     s3 = MagicMock()
-    s3.upload_dataframe.return_value = {"key": "fund/2026-05-14/fund_scale_history__part0.parquet", "size": 100}
+    s3.upload_dataframe.return_value = {"key": "_history_staging/fund_scale_history__part0.parquet", "size": 100}
 
     result = handler_module.run(
         event={"mode": "scale_full", "fund_codes": ["000001"],
@@ -116,6 +126,9 @@ def test_handler_scale_full_mode_invokes_scale_fetcher(handler_module):
 
     fetcher.fetch_scale_history.assert_called_once()
     fetcher.fetch_manager_history.assert_not_called()
+    upload_kwargs = s3.upload_dataframe.call_args.kwargs
+    assert upload_kwargs["category"] == "_history_staging"
+    assert upload_kwargs["data_name"] == "fund_scale_history__part0"
     assert result["mode"] == "scale_full"
     assert result["row_count"] == 1
 
@@ -220,25 +233,32 @@ def _put_parquet(s3_client, key: str, df: pd.DataFrame):
     s3_client.put_object(Bucket=BUCKET, Key=key, Body=buf.getvalue())
 
 
-def test_handler_manager_merge_concats_parts_into_single_file(handler_module, real_s3):
+CANONICAL_KEY = "fund/_history/fund_manager_history.parquet"
+SCALE_CANONICAL_KEY = "fund/_history/fund_scale_history.parquet"
+STAGING_PREFIX = "_history_staging"
+
+
+def test_handler_manager_merge_writes_canonical_path(handler_module, real_s3):
+    """Merge reads from staging, writes ONE canonical file under fund/_history/
+    (not date-partitioned). S3 versioning preserves history; replication
+    picks it up via the fund/ prefix rule."""
     snapshot = dt.date(2026, 5, 14)
     df0 = pd.DataFrame([{"基金代码": "000001", "经理姓名": "张三", "snapshot_date": snapshot}])
     df1 = pd.DataFrame([{"基金代码": "000002", "经理姓名": "李四", "snapshot_date": snapshot}])
-    _put_parquet(real_s3, "fund/2026-05-14/fund_manager_history__part0.parquet", df0)
-    _put_parquet(real_s3, "fund/2026-05-14/fund_manager_history__part1.parquet", df1)
+    _put_parquet(real_s3, f"{STAGING_PREFIX}/fund_manager_history__part0.parquet", df0)
+    _put_parquet(real_s3, f"{STAGING_PREFIX}/fund_manager_history__part1.parquet", df1)
 
     from shared.storage import S3Client
     s3_client = S3Client(BUCKET)
 
     result = handler_module.run(
-        event={"mode": "manager_merge", "snapshot_date": "2026-05-14", "partition_total": 2},
+        event={"mode": "manager_merge", "partition_total": 2},
         fetcher=MagicMock(),
         s3_client=s3_client,
         boto3_s3=real_s3,
     )
 
-    # Single merged file should now exist
-    obj = real_s3.get_object(Bucket=BUCKET, Key="fund/2026-05-14/fund_manager_history.parquet")
+    obj = real_s3.get_object(Bucket=BUCKET, Key=CANONICAL_KEY)
     import io
     merged = pd.read_parquet(io.BytesIO(obj["Body"].read()))
     assert len(merged) == 2
@@ -246,26 +266,26 @@ def test_handler_manager_merge_concats_parts_into_single_file(handler_module, re
     assert result["mode"] == "manager_merge"
     assert result["row_count"] == 2
     assert result["parts_merged"] == 2
+    assert result["s3"]["key"].endswith("fund/_history/fund_manager_history.parquet")
 
 
 def test_handler_merge_skips_missing_parts(handler_module, real_s3):
-    """If one partition Lambda failed, merge should still combine the remaining parts."""
     df0 = pd.DataFrame([{"基金代码": "000001"}])
     df2 = pd.DataFrame([{"基金代码": "000003"}])
-    _put_parquet(real_s3, "fund/2026-05-14/fund_manager_history__part0.parquet", df0)
+    _put_parquet(real_s3, f"{STAGING_PREFIX}/fund_manager_history__part0.parquet", df0)
     # part1 missing
-    _put_parquet(real_s3, "fund/2026-05-14/fund_manager_history__part2.parquet", df2)
+    _put_parquet(real_s3, f"{STAGING_PREFIX}/fund_manager_history__part2.parquet", df2)
     # part3 missing
 
     from shared.storage import S3Client
     result = handler_module.run(
-        event={"mode": "manager_merge", "snapshot_date": "2026-05-14", "partition_total": 4},
+        event={"mode": "manager_merge", "partition_total": 4},
         fetcher=MagicMock(),
         s3_client=S3Client(BUCKET),
         boto3_s3=real_s3,
     )
 
-    obj = real_s3.get_object(Bucket=BUCKET, Key="fund/2026-05-14/fund_manager_history.parquet")
+    obj = real_s3.get_object(Bucket=BUCKET, Key=CANONICAL_KEY)
     import io
     merged = pd.read_parquet(io.BytesIO(obj["Body"].read()))
     assert len(merged) == 2
@@ -273,29 +293,32 @@ def test_handler_merge_skips_missing_parts(handler_module, real_s3):
     assert result["parts_missing"] == 2
 
 
-def test_handler_merge_deletes_part_files_after_merge(handler_module, real_s3):
+def test_handler_merge_deletes_staging_parts(handler_module, real_s3):
     df0 = pd.DataFrame([{"基金代码": "000001"}])
-    _put_parquet(real_s3, "fund/2026-05-14/fund_manager_history__part0.parquet", df0)
+    _put_parquet(real_s3, f"{STAGING_PREFIX}/fund_manager_history__part0.parquet", df0)
 
     from shared.storage import S3Client
     handler_module.run(
-        event={"mode": "manager_merge", "snapshot_date": "2026-05-14", "partition_total": 1},
+        event={"mode": "manager_merge", "partition_total": 1},
         fetcher=MagicMock(),
         s3_client=S3Client(BUCKET),
         boto3_s3=real_s3,
     )
 
-    # Part file should be gone
-    listed = real_s3.list_objects_v2(Bucket=BUCKET, Prefix="fund/2026-05-14/")
-    keys = [obj["Key"] for obj in listed.get("Contents", [])]
-    assert "fund/2026-05-14/fund_manager_history__part0.parquet" not in keys
-    assert "fund/2026-05-14/fund_manager_history.parquet" in keys
+    # Staging part file should be gone
+    staging = real_s3.list_objects_v2(Bucket=BUCKET, Prefix=f"{STAGING_PREFIX}/")
+    staging_keys = [o["Key"] for o in staging.get("Contents", [])]
+    assert f"{STAGING_PREFIX}/fund_manager_history__part0.parquet" not in staging_keys
+    # Canonical file exists
+    canonical = real_s3.list_objects_v2(Bucket=BUCKET, Prefix="fund/_history/")
+    canonical_keys = [o["Key"] for o in canonical.get("Contents", [])]
+    assert CANONICAL_KEY in canonical_keys
 
 
 def test_handler_merge_no_parts_returns_empty_result(handler_module, real_s3):
     from shared.storage import S3Client
     result = handler_module.run(
-        event={"mode": "scale_merge", "snapshot_date": "2026-05-14", "partition_total": 4},
+        event={"mode": "scale_merge", "partition_total": 4},
         fetcher=MagicMock(),
         s3_client=S3Client(BUCKET),
         boto3_s3=real_s3,
@@ -304,3 +327,6 @@ def test_handler_merge_no_parts_returns_empty_result(handler_module, real_s3):
     assert result["parts_merged"] == 0
     assert result["parts_missing"] == 4
     assert result["row_count"] == 0
+    # No canonical file should exist either
+    listed = real_s3.list_objects_v2(Bucket=BUCKET, Prefix="fund/_history/")
+    assert not listed.get("Contents")

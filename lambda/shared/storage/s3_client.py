@@ -28,9 +28,17 @@ class S3Client:
         self.logger = get_logger(__name__)
 
     def _get_s3_key(
-        self, category: str, data_name: str, date: Optional[datetime] = None
+        self, category: str, data_name: str, date: Optional[datetime] = None,
+        with_date: bool = True,
     ) -> str:
-        """Generate S3 key for data file, prefixed with self.key_prefix."""
+        """Generate S3 key for data file, prefixed with self.key_prefix.
+
+        with_date=False omits the date partition directory, useful for
+        canonical/staging paths that overwrite a fixed location.
+        """
+        if not with_date:
+            return f"{self.key_prefix}{category}/{data_name}.parquet"
+
         if date is None:
             date = datetime.now()
 
@@ -44,6 +52,7 @@ class S3Client:
         category: str,
         data_name: str,
         date: Optional[datetime] = None,
+        with_date: bool = True,
     ) -> dict:
         """Upload a DataFrame to S3 as Parquet.
 
@@ -52,6 +61,7 @@ class S3Client:
             category: Data category (fund, stock, macro)
             data_name: Name of the data file
             date: Date for partitioning (defaults to today)
+            with_date: If False, omit the date dir from the key.
 
         Returns:
             Dict with upload details (bucket, key, size)
@@ -60,7 +70,7 @@ class S3Client:
             self.logger.warning(f"Empty DataFrame for {category}/{data_name}, skipping upload")
             return {"bucket": self.bucket_name, "key": None, "size": 0, "skipped": True}
 
-        s3_key = self._get_s3_key(category, data_name, date)
+        s3_key = self._get_s3_key(category, data_name, date, with_date=with_date)
 
         # Convert DataFrame to Parquet bytes
         parquet_buffer = io.BytesIO()

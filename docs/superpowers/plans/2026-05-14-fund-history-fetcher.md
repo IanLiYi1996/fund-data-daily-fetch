@@ -49,7 +49,11 @@
    - **季末 +3 天**：`fund_scale_history` 全量（季报数据公布有滞后，3 天缓冲）
    - **每日 17:30 UTC**：可选的 `fund_manager_em` diff 增量，零额外调用，捕获日内人事变动用于告警/审计（不写主表）
 
-3. **每日可见性**：`catalog-generator` 末尾做 S3 `CopyObject`，把最近一份 `fund_manager_history.parquet` / `fund_scale_history.parquet` 复制到 `fund/{今天}/`。孟老板的 `pd.read_parquet(f'fund/{today}/fund_manager_history.parquet')` 永远成立。
+3. **Canonical 路径，零冗余**：
+   - 真实刷新写到 `fund/_history/fund_manager_history.parquet` / `fund/_history/fund_scale_history.parquet`（覆盖）
+   - S3 Versioning 自动保留旧版本 365 天（noncurrent expiration policy），可按 versionId 回溯
+   - per-partition 中间文件落到 `_history_staging/{name}__part{i}.parquet` —— 在 `fund/` 前缀之外，**不被 S3 Replication 复制**到孟老板那边
+   - 孟老板读固定路径：`pd.read_parquet('s3://financial-dataset-mx/fund-data-pipeline/fund/_history/fund_manager_history.parquet')` —— 一行代码，不需要每天判断日期
 
 ## 表结构
 
@@ -152,26 +156,7 @@ new events.Rule(this, "QuarterlyScaleHistory", {
 
 ## catalog-generator 改动
 
-在末尾追加：
-
-```python
-def copy_latest_history_to_today(s3, bucket, today):
-    for name in ["fund_manager_history", "fund_scale_history"]:
-        # 找最近 90 天内的真实文件
-        latest_key = find_latest_real_file(s3, bucket, "fund", name, today, lookback_days=90)
-        if latest_key is None:
-            logger.warning(f"No history file found for {name} in last 90d")
-            continue
-        today_key = f"fund/{today.isoformat()}/{name}.parquet"
-        if latest_key == today_key:
-            continue  # 今天就是真实刷新日
-        s3.copy_object(
-            Bucket=bucket, Key=today_key,
-            CopySource={"Bucket": bucket, "Key": latest_key},
-            Metadata={"copied_from": latest_key, "copy_at": now()},
-            MetadataDirective="REPLACE",
-        )
-```
+不需要改动。canonical 路径 `fund/_history/` 由 fund-history-fetcher 自身维护，S3 Versioning 提供时光机能力，无需每日 CopyObject。
 
 `find_latest_real_file` 跳过自身的 copy（用 metadata `copied_from` 是否存在判断），保证不会做"复制的复制"。
 
@@ -188,7 +173,7 @@ def copy_latest_history_to_today(s3, bucket, today):
 
 - 单元：`fund_history_fetcher.parse_manager_change_df`（中英列、单经理 vs 多经理、缺失结束日）
 - 集成：`moto` mock S3，跑 50 只基金小样本 → 验证 partition merge 后行数和 PK 唯一性
-- E2E（dev 账号）：单 partition 跑 1k 基金 → 1 个 manager_history 文件 → catalog-generator copy → `fund/{今天}/` 可读
+- E2E（dev 账号）：4 个 partition 跑全量 → merge 输出 `fund/_history/fund_manager_history.parquet` → S3 Replication 镜像到 mengxin 端
 
 ## 实施里程碑
 
@@ -197,17 +182,20 @@ def copy_latest_history_to_today(s3, bucket, today):
 | M1 | `fund_history_fetcher.py` + 单元测试 | 0.5 天 |
 | M2 | Lambda 容器 + Dockerfile + handler partition 逻辑 | 0.5 天 |
 | M3 | Step Functions Map state machine + EventBridge | 0.5 天 |
-| M4 | catalog-generator 加 copy_latest_history_to_today | 0.5 天 |
+| M4 | ~~catalog-generator daily copy~~（不需要，canonical 路径替代）| 0 天 |
 | M5 | dev E2E + prod 切换 | 0.5 天 |
 
 总计：~2.5 工作日。
 
 ## 与孟老板的接口契约
 
-- **路径**：`s3://{bucket}/fund/{YYYY-MM-DD}/fund_manager_history.parquet` 和 `fund_scale_history.parquet`
-- **每日可读**：✅（真实刷新日 + S3 copy 续推）
+- **路径**（固定，覆盖式更新）：
+  - `s3://financial-dataset-mx/fund-data-pipeline/fund/_history/fund_manager_history.parquet`
+  - `s3://financial-dataset-mx/fund-data-pipeline/fund/_history/fund_scale_history.parquet`
+- **同步机制**：S3 Replication 规则 `replicate-fund`（前缀 `fund-data-pipeline/fund/`）自动镜像到孟老板账号
 - **PK**：`基金代码`（与现有所有 fund_*.parquet 一致）
 - **延迟**：经理任期最多滞后 6 天（周日刷新），规模最多滞后 1 季度 + 3 天
+- **时光机**：源 bucket 启用 versioning，旧版本保留 365 天，可按 versionId 回溯
 - **变更通告**：上线前 + schema 改动时邮件知会
 
 ## 不做（YAGNI）

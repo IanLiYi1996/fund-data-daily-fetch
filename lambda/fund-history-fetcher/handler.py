@@ -1,25 +1,30 @@
 """Lambda handler for per-fund manager + scale history fetch.
 
+Storage layout (no per-day duplication):
+- Per-partition (intermediate, NOT replicated to mengxin):
+    {prefix}_history_staging/{base}__part{i}.parquet
+- Canonical merged output (replicated to mengxin via fund/ prefix rule):
+    {prefix}fund/_history/{base}.parquet  (S3 versioning preserves history)
+
 Two modes:
 1. *_full   — Map state fans out partitions; each partition Lambda fetches
-              its slice and writes fund_*_history__part{i}.parquet
+              its slice and writes a part file under _history_staging/
 2. *_merge  — runs after the Map; concats all part files into a single
-              fund_*_history.parquet and deletes the parts
+              fund/_history/{base}.parquet (overwrites, versioned) and
+              deletes the staging parts
 
 Event shape (full mode):
     {
       "mode": "manager_full" | "scale_full",
       "fund_codes": ["000001", ...],     # optional; bootstrapped if missing
       "partition_index": 0,
-      "partition_total": 4,
-      "snapshot_date": "2026-05-14"
+      "partition_total": 4
     }
 
 Event shape (merge mode):
     {
       "mode": "manager_merge" | "scale_merge",
-      "partition_total": 4,
-      "snapshot_date": "2026-05-14"
+      "partition_total": 4
     }
 """
 from __future__ import annotations
@@ -52,6 +57,14 @@ _OUTPUT_NAME = {
     "scale_merge": "fund_scale_history",
 }
 
+# Per-partition intermediate files. Outside the fund/ prefix so S3
+# Replication's fund/ rule does NOT mirror these to mengxin.
+STAGING_CATEGORY = "_history_staging"
+
+# Canonical merged-output prefix under fund/ — replicated to mengxin and
+# kept at one stable path with S3 versioning preserving older versions.
+CANONICAL_SUBDIR = "_history"
+
 
 def slice_partition(items: list[str], partition_index: int, partition_total: int) -> list[str]:
     """Split items into partition_total contiguous chunks; return the partition_index-th."""
@@ -71,6 +84,35 @@ def fetch_fund_universe() -> list[str]:
     return df["基金代码"].astype(str).str.zfill(6).tolist()
 
 
+def _staging_key(s3_client: S3Client, base_name: str, partition_index: int) -> str:
+    key_prefix = getattr(s3_client, "key_prefix", "") or ""
+    return f"{key_prefix}{STAGING_CATEGORY}/{base_name}__part{partition_index}.parquet"
+
+
+def _canonical_key(s3_client: S3Client, base_name: str) -> str:
+    key_prefix = getattr(s3_client, "key_prefix", "") or ""
+    return f"{key_prefix}fund/{CANONICAL_SUBDIR}/{base_name}.parquet"
+
+
+def _put_parquet(s3, bucket: str, key: str, df: pd.DataFrame) -> dict[str, Any]:
+    """Write a DataFrame to S3 as parquet at an explicit key (no date dir)."""
+    buf = io.BytesIO()
+    df.to_parquet(buf, engine="pyarrow", index=False)
+    body = buf.getvalue()
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=body,
+        ContentType="application/x-parquet",
+        Metadata={
+            "row_count": str(len(df)),
+            "column_count": str(len(df.columns)),
+            "created_at": dt.datetime.utcnow().isoformat(),
+        },
+    )
+    return {"bucket": bucket, "key": key, "size": len(body), "rows": len(df)}
+
+
 def run(
     event: dict,
     fetcher: FundHistoryFetcher,
@@ -83,13 +125,13 @@ def run(
     if mode not in VALID_MODES:
         raise ValueError(f"invalid mode: {mode!r}; expected one of {VALID_MODES}")
 
+    if mode in MERGE_MODES:
+        return _run_merge(mode, event, s3_client, boto3_s3)
+
     snapshot_str = event.get("snapshot_date")
     snapshot_date = (
         dt.date.fromisoformat(snapshot_str) if snapshot_str else dt.datetime.utcnow().date()
     )
-
-    if mode in MERGE_MODES:
-        return _run_merge(mode, snapshot_date, event, s3_client, boto3_s3)
 
     fund_codes = event.get("fund_codes")
     if not fund_codes:
@@ -111,12 +153,12 @@ def run(
 
     upload_info: dict[str, Any] = {}
     if not df.empty:
-        data_name = f"{_OUTPUT_NAME[mode]}__part{partition_index}"
         upload_info = s3_client.upload_dataframe(
             df=df,
-            category="fund",
-            data_name=data_name,
-            date=dt.datetime.combine(snapshot_date, dt.time.min),
+            category=STAGING_CATEGORY,
+            data_name=f"{_OUTPUT_NAME[mode]}__part{partition_index}",
+            date=None,
+            with_date=False,
         )
 
     return {
@@ -135,7 +177,6 @@ def run(
 
 def _run_merge(
     mode: str,
-    snapshot_date: dt.date,
     event: dict,
     s3_client: S3Client,
     boto3_s3: Optional[Any],
@@ -144,16 +185,12 @@ def _run_merge(
     base_name = _OUTPUT_NAME[mode]
     s3 = boto3_s3 if boto3_s3 is not None else boto3.client("s3")
     bucket = s3_client.bucket_name
-    # Honor S3 key_prefix from S3Client so we read part files from the same
-    # location upload_dataframe wrote them to.
-    key_prefix = getattr(s3_client, "key_prefix", "") or ""
-    date_prefix = f"{key_prefix}fund/{snapshot_date.isoformat()}"
 
     frames: list[pd.DataFrame] = []
     merged_keys: list[str] = []
     missing = 0
     for i in range(partition_total):
-        part_key = f"{date_prefix}/{base_name}__part{i}.parquet"
+        part_key = _staging_key(s3_client, base_name, i)
         try:
             obj = s3.get_object(Bucket=bucket, Key=part_key)
         except Exception as exc:
@@ -169,31 +206,25 @@ def _run_merge(
         return {
             "success": True,
             "mode": mode,
-            "snapshot_date": snapshot_date.isoformat(),
             "parts_merged": 0,
             "parts_missing": partition_total,
             "row_count": 0,
         }
 
     merged_df = pd.concat(frames, ignore_index=True)
-    upload_info = s3_client.upload_dataframe(
-        df=merged_df,
-        category="fund",
-        data_name=base_name,
-        date=dt.datetime.combine(snapshot_date, dt.time.min),
-    )
+    canonical_key = _canonical_key(s3_client, base_name)
+    upload_info = _put_parquet(s3, bucket, canonical_key, merged_df)
 
-    # Delete part files after successful merge upload
+    # Delete staging part files after successful merge upload
     for key in merged_keys:
         try:
             s3.delete_object(Bucket=bucket, Key=key)
         except Exception as exc:
-            logger.warning(f"failed to delete part file {key}: {exc}")
+            logger.warning(f"failed to delete staging part {key}: {exc}")
 
     return {
         "success": True,
         "mode": mode,
-        "snapshot_date": snapshot_date.isoformat(),
         "parts_merged": len(merged_keys),
         "parts_missing": missing,
         "row_count": len(merged_df),

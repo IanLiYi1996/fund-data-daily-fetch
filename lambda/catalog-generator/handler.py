@@ -1,84 +1,14 @@
 """Lambda handler for generating data catalog from processing results."""
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Any, Dict
-
-import boto3
 
 from shared.utils.config import Config
 from shared.utils.logger import get_logger
 from shared.storage import S3Client
 
 logger = get_logger(__name__)
-
-
-HISTORY_TABLES = ("fund_manager_history", "fund_scale_history")
-
-
-def copy_latest_history_to_today(
-    s3, bucket: str, today: date, lookback_days: int = 90, key_prefix: str = ""
-) -> Dict[str, Dict[str, str]]:
-    """Ensure {prefix}fund/{today}/{name}.parquet exists for every history table.
-
-    For each entry in HISTORY_TABLES:
-    - If a real (non-copied) file already lives at today's path, skip it.
-    - Otherwise walk back day-by-day up to lookback_days, find the most recent
-      real source file, and CopyObject it to today's path with metadata
-      `copied_from` set so we can distinguish copies from real refreshes.
-    """
-    results: Dict[str, Dict[str, str]] = {}
-    for name in HISTORY_TABLES:
-        results[name] = _copy_one(s3, bucket, today, name, lookback_days, key_prefix)
-    return results
-
-
-def _copy_one(
-    s3, bucket: str, today: date, name: str, lookback_days: int, key_prefix: str
-) -> Dict[str, str]:
-    today_key = f"{key_prefix}fund/{today.isoformat()}/{name}.parquet"
-    head = _head_object(s3, bucket, today_key)
-    if head is not None and "copied_from" not in (head.get("Metadata") or {}):
-        return {"status": "skipped_real_exists", "key": today_key}
-
-    for delta in range(1, lookback_days + 1):
-        candidate_date = today - timedelta(days=delta)
-        candidate_key = f"{key_prefix}fund/{candidate_date.isoformat()}/{name}.parquet"
-        candidate = _head_object(s3, bucket, candidate_key)
-        if candidate is None:
-            continue
-        if "copied_from" in (candidate.get("Metadata") or {}):
-            continue
-        s3.copy_object(
-            Bucket=bucket,
-            Key=today_key,
-            CopySource={"Bucket": bucket, "Key": candidate_key},
-            Metadata={
-                "copied_from": candidate_key,
-                "copied_at": datetime.now().isoformat(),
-            },
-            MetadataDirective="REPLACE",
-        )
-        logger.info(f"copied {candidate_key} → {today_key}")
-        return {
-            "status": "copied",
-            "key": today_key,
-            "copied_from": candidate_key,
-        }
-
-    logger.warning(f"no recent {name} file in last {lookback_days} days")
-    return {"status": "not_found"}
-
-
-def _head_object(s3, bucket: str, key: str):
-    try:
-        return s3.head_object(Bucket=bucket, Key=key)
-    except Exception as exc:
-        if hasattr(exc, "response") and exc.response.get("Error", {}).get("Code") in {
-            "404", "NoSuchKey", "NotFound"
-        }:
-            return None
-        raise
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -224,20 +154,6 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             logger.exception("Consistency check failed (non-fatal)")
             catalog["consistency_check"] = {"error": str(e)}
 
-        # Continuously republish the latest fund-history files into today's
-        # directory so consumers can always read fund/{today}/fund_*_history.parquet.
-        history_copy: Dict[str, Any] = {}
-        try:
-            history_copy = copy_latest_history_to_today(
-                boto3.client("s3"),
-                config.s3_bucket,
-                datetime.utcnow().date(),
-                key_prefix=getattr(config, "s3_prefix", "") or "",
-            )
-        except Exception as e:
-            logger.error(f"copy_latest_history_to_today failed: {e}")
-            history_copy = {"error": str(e)}
-
         elapsed = (datetime.now() - start_time).total_seconds()
 
         return {
@@ -246,7 +162,6 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "success": True,
             "catalog_date": date_str,
             "summary": catalog["summary"],
-            "history_copy": history_copy,
             "elapsed_seconds": round(elapsed, 2),
             "timestamp": datetime.now().isoformat(),
         }
