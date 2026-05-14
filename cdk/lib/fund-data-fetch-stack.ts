@@ -563,7 +563,10 @@ export class FundDataFetchStack extends Stack {
     // fund_*_history__part{i}.parquet, then run a merge step that concats
     // the parts into a single fund_*_history.parquet and deletes the parts.
 
-    const FUND_HISTORY_PARTITIONS = 4;
+    // 8 partitions × ~3.1k funds/partition × 8 worker concurrency
+    // ≈ 7-8 min/partition. Stays well under Lambda 15 min timeout for both
+    // manager (fast HTML page) and scale (~500 KB pingzhongdata.js per fund).
+    const FUND_HISTORY_PARTITIONS = 8;
 
     const partitionTask = new tasks.LambdaInvoke(
       this,
