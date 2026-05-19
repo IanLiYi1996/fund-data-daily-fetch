@@ -281,24 +281,56 @@ export class FundDataFetchStack extends Stack {
       }
     );
 
-    // Fund fetch branch
-    parallelCollection.branch(
-      new tasks.LambdaInvoke(this, "InvokeFundFetch", {
+    // Fund fetch branch — partitioned fan-out by table.
+    //
+    // Previously a single Lambda fetched all 21 fund tables serially via
+    // akshare and routinely hit the 15 min Lambda timeout (fetch ~9 min +
+    // upserts ~7 min). Splitting them into a Map state runs each table in
+    // its own Lambda concurrently, so the slowest single table (~5 min:
+    // fund_daily fetch + upsert) bounds the whole branch.
+    const FUND_TABLES = [
+      "fund_performance", "fund_etf", "fund_name", "fund_manager",
+      "fund_daily", "fund_money_daily", "fund_financial_daily",
+      "fund_etf_daily", "fund_lof", "fund_value_estimation", "fund_purchase",
+      "fund_exchange_rank", "fund_money_rank", "fund_hk_rank",
+      "fund_rating", "fund_dividend_rank", "fund_dividend", "fund_split",
+      "fund_index_info", "fund_graded_daily", "fund_reits_daily",
+    ];
+
+    const fundPartitionTask = new tasks.LambdaInvoke(
+      this,
+      "InvokeFundPartition",
+      {
         lambdaFunction: fundFetchLambda,
         retryOnServiceExceptions: true,
         payloadResponseOnly: true,
-        comment: "Fund data (20 sources)",
-      }).addCatch(
-        new sfn.Pass(this, "FundFetchFailed", {
-          result: sfn.Result.fromObject({
-            downloader: "fund",
-            success: false,
-            error: "Lambda invocation failed",
-          }),
+        comment: "Fetch one fund table partition",
+      }
+    ).addCatch(
+      new sfn.Pass(this, "FundPartitionFailed", {
+        result: sfn.Result.fromObject({
+          downloader: "fund",
+          success: false,
+          error: "Lambda partition failed",
         }),
-        { errors: ["States.ALL"], resultPath: "$" }
-      )
+      }),
+      { errors: ["States.ALL"] }
     );
+
+    const fundMap = new sfn.Map(this, "FundPartitionMap", {
+      itemsPath: "$.fund_partitions",
+      maxConcurrency: 8,
+      comment: "Fan out fund fetch across 21 table slices (cap concurrency to 8 to avoid akshare rate limits)",
+    });
+    fundMap.itemProcessor(fundPartitionTask);
+
+    const fundBranch = new sfn.Pass(this, "FundSeed", {
+      result: sfn.Result.fromObject({
+        fund_partitions: FUND_TABLES.map((table) => ({ table })),
+      }),
+    }).next(fundMap);
+
+    parallelCollection.branch(fundBranch);
 
     // CN Index fetch branch
     parallelCollection.branch(
@@ -395,24 +427,57 @@ export class FundDataFetchStack extends Stack {
       )
     );
 
-    // Historical K-line fetch branch
-    parallelCollection.branch(
-      new tasks.LambdaInvoke(this, "InvokeHistKlineFetch", {
+    // Historical K-line fetch branch — partitioned fan-out.
+    //
+    // 9 partitions = 3 markets (a_share, hk, us) × 3 frequencies (daily,
+    // weekly, monthly). Previously a single Lambda fetched all 9 serially
+    // via yfinance and routinely hit the 15 min Lambda timeout. Splitting
+    // them into a Map state runs each (market, frequency) in its own
+    // Lambda concurrently, so the slowest single partition (~3 min)
+    // bounds the whole branch.
+    const HIST_KLINE_PARTITIONS: Array<{ market: string; interval: string }> = [];
+    for (const market of ["a_share", "hk", "us"]) {
+      for (const interval of ["daily", "weekly", "monthly"]) {
+        HIST_KLINE_PARTITIONS.push({ market, interval });
+      }
+    }
+
+    const histKlinePartitionTask = new tasks.LambdaInvoke(
+      this,
+      "InvokeHistKlinePartition",
+      {
         lambdaFunction: histKlineFetchLambda,
         retryOnServiceExceptions: true,
         payloadResponseOnly: true,
-        comment: "Historical K-line data (9 sources: 3 markets x 3 frequencies)",
-      }).addCatch(
-        new sfn.Pass(this, "HistKlineFetchFailed", {
-          result: sfn.Result.fromObject({
-            downloader: "hist-kline",
-            success: false,
-            error: "Lambda invocation failed",
-          }),
+        comment: "Fetch one (market, frequency) hist-kline partition",
+      }
+    ).addCatch(
+      new sfn.Pass(this, "HistKlinePartitionFailed", {
+        result: sfn.Result.fromObject({
+          downloader: "hist-kline",
+          success: false,
+          error: "Lambda partition failed",
         }),
-        { errors: ["States.ALL"], resultPath: "$" }
-      )
+      }),
+      { errors: ["States.ALL"] }
     );
+
+    const histKlineMap = new sfn.Map(this, "HistKlinePartitionMap", {
+      itemsPath: "$.hist_kline_partitions",
+      maxConcurrency: HIST_KLINE_PARTITIONS.length,
+      comment: "Fan out hist-kline fetch across 9 (market, frequency) slices",
+    });
+    histKlineMap.itemProcessor(histKlinePartitionTask);
+
+    // Inject the partitions array at the start of the branch so the
+    // top-level workflow input doesn't need to know about hist-kline.
+    const histKlineBranch = new sfn.Pass(this, "HistKlineSeed", {
+      result: sfn.Result.fromObject({
+        hist_kline_partitions: HIST_KLINE_PARTITIONS,
+      }),
+    }).next(histKlineMap);
+
+    parallelCollection.branch(histKlineBranch);
 
     // Data processor step (sequential after parallel, before catalog)
     // Passes minimal trigger event — processor reads parquet directly from S3

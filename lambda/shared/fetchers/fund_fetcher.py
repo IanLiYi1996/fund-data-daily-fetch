@@ -227,45 +227,52 @@ class FundFetcher(BaseFetcher):
     def category(self) -> str:
         return "fund"
 
+    @property
+    def TABLE_METHODS(self):
+        return {
+            "fund_performance": self._fetch_fund_performance,
+            "fund_etf": self._fetch_fund_etf,
+            "fund_name": self._fetch_fund_name,
+            "fund_manager": self._fetch_fund_manager,
+            "fund_daily": self._fetch_fund_daily,
+            "fund_money_daily": self._fetch_fund_money_daily,
+            "fund_financial_daily": self._fetch_fund_financial_daily,
+            "fund_etf_daily": self._fetch_fund_etf_daily,
+            "fund_lof": self._fetch_fund_lof,
+            "fund_value_estimation": self._fetch_fund_value_estimation,
+            "fund_purchase": self._fetch_fund_purchase,
+            "fund_exchange_rank": self._fetch_fund_exchange_rank,
+            "fund_money_rank": self._fetch_fund_money_rank,
+            "fund_hk_rank": self._fetch_fund_hk_rank,
+            "fund_rating": self._fetch_fund_rating,
+            "fund_dividend_rank": self._fetch_fund_dividend_rank,
+            "fund_dividend": self._fetch_fund_dividend,
+            "fund_split": self._fetch_fund_split,
+            "fund_index_info": self._fetch_fund_index_info,
+            "fund_graded_daily": self._fetch_fund_graded_daily,
+            "fund_reits_daily": self._fetch_fund_reits_daily,
+        }
+
+    @classmethod
+    def list_tables(cls) -> list[str]:
+        # Class-level access without instantiation; mirrors TABLE_METHODS keys.
+        return [
+            "fund_performance", "fund_etf", "fund_name", "fund_manager",
+            "fund_daily", "fund_money_daily", "fund_financial_daily",
+            "fund_etf_daily", "fund_lof", "fund_value_estimation", "fund_purchase",
+            "fund_exchange_rank", "fund_money_rank", "fund_hk_rank",
+            "fund_rating", "fund_dividend_rank", "fund_dividend", "fund_split",
+            "fund_index_info", "fund_graded_daily", "fund_reits_daily",
+        ]
+
+    def fetch_one(self, table: str) -> FetchResult:
+        method = self.TABLE_METHODS.get(table)
+        if method is None:
+            return FetchResult(name=table, success=False, error=f"unknown table: {table}")
+        return self._safe_fetch(table, method)
+
     def fetch_all(self) -> FetchSummary:
-        """Fetch all fund data."""
-        results = []
-
-        # ===== Existing interfaces =====
-        results.append(self._safe_fetch("fund_performance", self._fetch_fund_performance))
-        results.append(self._safe_fetch("fund_etf", self._fetch_fund_etf))
-        results.append(self._safe_fetch("fund_name", self._fetch_fund_name))
-        results.append(self._safe_fetch("fund_manager", self._fetch_fund_manager))
-
-        # ===== Priority 1: Daily real-time data =====
-        results.append(self._safe_fetch("fund_daily", self._fetch_fund_daily))
-        results.append(self._safe_fetch("fund_money_daily", self._fetch_fund_money_daily))
-        results.append(self._safe_fetch("fund_financial_daily", self._fetch_fund_financial_daily))
-        results.append(self._safe_fetch("fund_etf_daily", self._fetch_fund_etf_daily))
-        results.append(self._safe_fetch("fund_lof", self._fetch_fund_lof))
-        results.append(self._safe_fetch("fund_value_estimation", self._fetch_fund_value_estimation))
-        results.append(self._safe_fetch("fund_purchase", self._fetch_fund_purchase))
-
-        # ===== Priority 2: Ranking and rating data =====
-        results.append(self._safe_fetch("fund_exchange_rank", self._fetch_fund_exchange_rank))
-        results.append(self._safe_fetch("fund_money_rank", self._fetch_fund_money_rank))
-        results.append(self._safe_fetch("fund_hk_rank", self._fetch_fund_hk_rank))
-        results.append(self._safe_fetch("fund_rating", self._fetch_fund_rating))
-        results.append(self._safe_fetch("fund_dividend_rank", self._fetch_fund_dividend_rank))
-
-        # ===== Priority 3: Dividend and split data =====
-        results.append(self._safe_fetch("fund_dividend", self._fetch_fund_dividend))
-        results.append(self._safe_fetch("fund_split", self._fetch_fund_split))
-
-        # ===== Priority 4: Index fund specific =====
-        results.append(self._safe_fetch("fund_index_info", self._fetch_fund_index_info))
-        results.append(self._safe_fetch("fund_graded_daily", self._fetch_fund_graded_daily))
-
-        # ===== Priority 5: REITs (closed/FOF deferred — akshare has no direct API) =====
-        # fund_close_daily and fund_fof_daily need per-code akshare APIs; skip until a
-        # fan-out design lands. fund_portfolio_hold is similarly quarterly per-fund.
-        results.append(self._safe_fetch("fund_reits_daily", self._fetch_fund_reits_daily))
-
+        results = [self.fetch_one(name) for name in self.list_tables()]
         return FetchSummary(category=self.category, results=results)
 
     def _fetch_fund_performance(self):
