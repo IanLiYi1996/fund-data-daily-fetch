@@ -16,20 +16,24 @@ class BaseProcessor(ABC):
     """Abstract base for data processors that read parquet and write JSON.
 
     Handles: S3 read/write, NaN sanitization, dual-write (latest + dated).
+    All S3 keys are prefixed with self.key_prefix (from S3_PREFIX env var).
     """
 
     def __init__(self, s3_client, bucket: str, date_str: str) -> None:
+        import os
+
         self.s3 = s3_client
         self.bucket = bucket
         self.date_str = date_str
+        self.key_prefix = os.environ.get("S3_PREFIX", "")
         self.logger = get_logger(self.__class__.__name__)
         self._write_count = 0
 
     # ── S3 Read ─────────────────────────────────────────────────────────
 
     def read_parquet(self, category: str, name: str) -> Optional[pd.DataFrame]:
-        """Read s3://{bucket}/{category}/{date}/{name}.parquet into DataFrame."""
-        s3_key = f"{category}/{self.date_str}/{name}.parquet"
+        """Read s3://{bucket}/{prefix}{category}/{date}/{name}.parquet into DataFrame."""
+        s3_key = f"{self.key_prefix}{category}/{self.date_str}/{name}.parquet"
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=s3_key)
             buf = io.BytesIO(resp["Body"].read())
@@ -58,10 +62,10 @@ class BaseProcessor(ABC):
         }
         body = json.dumps(wrapped, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
-        for prefix in (f"data/latest/{path}", f"data/{self.date_str}/{path}"):
+        for relpath in (f"data/latest/{path}", f"data/{self.date_str}/{path}"):
             self.s3.put_object(
                 Bucket=self.bucket,
-                Key=prefix,
+                Key=f"{self.key_prefix}{relpath}",
                 Body=body,
                 ContentType="application/json; charset=utf-8",
             )

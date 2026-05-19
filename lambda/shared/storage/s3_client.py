@@ -11,34 +11,39 @@ from shared.utils.retry import retry_with_backoff
 class S3Client:
     """Client for uploading data to S3 in Parquet format."""
 
-    def __init__(self, bucket_name: str) -> None:
+    def __init__(self, bucket_name: str, key_prefix: str = "") -> None:
         """Initialize S3 client.
 
         Args:
             bucket_name: Name of the S3 bucket to upload to
+            key_prefix: Optional S3 key prefix (e.g. "fund-data-pipeline/").
+                Reads S3_PREFIX env var when not provided. Empty string means
+                keys are written at bucket root (legacy behavior).
         """
+        import os
+
         self.bucket_name = bucket_name
+        self.key_prefix = key_prefix or os.environ.get("S3_PREFIX", "")
         self.s3_client = boto3.client("s3")
         self.logger = get_logger(__name__)
 
     def _get_s3_key(
-        self, category: str, data_name: str, date: Optional[datetime] = None
+        self, category: str, data_name: str, date: Optional[datetime] = None,
+        with_date: bool = True,
     ) -> str:
-        """Generate S3 key for data file.
+        """Generate S3 key for data file, prefixed with self.key_prefix.
 
-        Args:
-            category: Data category (fund, stock, macro)
-            data_name: Name of the data file
-            date: Date for partitioning (defaults to today)
-
-        Returns:
-            S3 key in format: {category}/{YYYY-MM-DD}/{data_name}.parquet
+        with_date=False omits the date partition directory, useful for
+        canonical/staging paths that overwrite a fixed location.
         """
+        if not with_date:
+            return f"{self.key_prefix}{category}/{data_name}.parquet"
+
         if date is None:
             date = datetime.now()
 
         date_str = date.strftime("%Y-%m-%d")
-        return f"{category}/{date_str}/{data_name}.parquet"
+        return f"{self.key_prefix}{category}/{date_str}/{data_name}.parquet"
 
     @retry_with_backoff(max_retries=3, initial_delay=1.0)
     def upload_dataframe(
@@ -47,6 +52,7 @@ class S3Client:
         category: str,
         data_name: str,
         date: Optional[datetime] = None,
+        with_date: bool = True,
     ) -> dict:
         """Upload a DataFrame to S3 as Parquet.
 
@@ -55,6 +61,7 @@ class S3Client:
             category: Data category (fund, stock, macro)
             data_name: Name of the data file
             date: Date for partitioning (defaults to today)
+            with_date: If False, omit the date dir from the key.
 
         Returns:
             Dict with upload details (bucket, key, size)
@@ -63,7 +70,7 @@ class S3Client:
             self.logger.warning(f"Empty DataFrame for {category}/{data_name}, skipping upload")
             return {"bucket": self.bucket_name, "key": None, "size": 0, "skipped": True}
 
-        s3_key = self._get_s3_key(category, data_name, date)
+        s3_key = self._get_s3_key(category, data_name, date, with_date=with_date)
 
         # Convert DataFrame to Parquet bytes
         parquet_buffer = io.BytesIO()
@@ -136,6 +143,10 @@ class S3Client:
             Dict with upload details
         """
         import json
+
+        # Prefix the key if the caller didn't already include it
+        if self.key_prefix and not s3_key.startswith(self.key_prefix):
+            s3_key = f"{self.key_prefix}{s3_key}"
 
         json_bytes = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
 

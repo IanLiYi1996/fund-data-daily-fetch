@@ -174,6 +174,39 @@ class FundFetcher(BaseFetcher):
             "key_fields": ["基金代码", "基金简称", "单位净值", "折溢价率"],
             "has_fee_data": False,
         },
+        # Priority 5: Closed-end / REITs / FOF / portfolio
+        "fund_close_daily": {
+            "name_cn": "场内封闭式基金",
+            "description": "场内封闭式基金净值与折溢价",
+            "source_api": "fund_close_em",
+            "update_frequency": "daily",
+            "key_fields": ["基金代码", "基金简称", "最新价", "单位净值", "折溢价率"],
+            "has_fee_data": False,
+        },
+        "fund_fof_daily": {
+            "name_cn": "FOF 基金每日",
+            "description": "FOF 基金每日净值与收益",
+            "source_api": "fund_fof_em",
+            "update_frequency": "daily",
+            "key_fields": ["基金代码", "基金简称", "单位净值", "累计净值"],
+            "has_fee_data": False,
+        },
+        "fund_reits_daily": {
+            "name_cn": "公募 REITs",
+            "description": "公募 REITs 实时行情",
+            "source_api": "public_fund_REITs",
+            "update_frequency": "daily",
+            "key_fields": ["代码", "名称", "最新价", "涨跌幅"],
+            "has_fee_data": False,
+        },
+        "fund_portfolio_hold": {
+            "name_cn": "基金持仓明细",
+            "description": "基金季度报告持仓明细（低频）",
+            "source_api": "fund_portfolio_hold_em",
+            "update_frequency": "quarterly",
+            "key_fields": ["基金代码", "报告期", "持仓代码", "持仓名称", "占净值比例"],
+            "has_fee_data": False,
+        },
     }
 
     @classmethod
@@ -194,40 +227,52 @@ class FundFetcher(BaseFetcher):
     def category(self) -> str:
         return "fund"
 
+    @property
+    def TABLE_METHODS(self):
+        return {
+            "fund_performance": self._fetch_fund_performance,
+            "fund_etf": self._fetch_fund_etf,
+            "fund_name": self._fetch_fund_name,
+            "fund_manager": self._fetch_fund_manager,
+            "fund_daily": self._fetch_fund_daily,
+            "fund_money_daily": self._fetch_fund_money_daily,
+            "fund_financial_daily": self._fetch_fund_financial_daily,
+            "fund_etf_daily": self._fetch_fund_etf_daily,
+            "fund_lof": self._fetch_fund_lof,
+            "fund_value_estimation": self._fetch_fund_value_estimation,
+            "fund_purchase": self._fetch_fund_purchase,
+            "fund_exchange_rank": self._fetch_fund_exchange_rank,
+            "fund_money_rank": self._fetch_fund_money_rank,
+            "fund_hk_rank": self._fetch_fund_hk_rank,
+            "fund_rating": self._fetch_fund_rating,
+            "fund_dividend_rank": self._fetch_fund_dividend_rank,
+            "fund_dividend": self._fetch_fund_dividend,
+            "fund_split": self._fetch_fund_split,
+            "fund_index_info": self._fetch_fund_index_info,
+            "fund_graded_daily": self._fetch_fund_graded_daily,
+            "fund_reits_daily": self._fetch_fund_reits_daily,
+        }
+
+    @classmethod
+    def list_tables(cls) -> list[str]:
+        # Class-level access without instantiation; mirrors TABLE_METHODS keys.
+        return [
+            "fund_performance", "fund_etf", "fund_name", "fund_manager",
+            "fund_daily", "fund_money_daily", "fund_financial_daily",
+            "fund_etf_daily", "fund_lof", "fund_value_estimation", "fund_purchase",
+            "fund_exchange_rank", "fund_money_rank", "fund_hk_rank",
+            "fund_rating", "fund_dividend_rank", "fund_dividend", "fund_split",
+            "fund_index_info", "fund_graded_daily", "fund_reits_daily",
+        ]
+
+    def fetch_one(self, table: str) -> FetchResult:
+        method = self.TABLE_METHODS.get(table)
+        if method is None:
+            return FetchResult(name=table, success=False, error=f"unknown table: {table}")
+        return self._safe_fetch(table, method)
+
     def fetch_all(self) -> FetchSummary:
-        """Fetch all fund data."""
-        results = []
-
-        # ===== Existing interfaces =====
-        results.append(self._safe_fetch("fund_performance", self._fetch_fund_performance))
-        results.append(self._safe_fetch("fund_etf", self._fetch_fund_etf))
-        results.append(self._safe_fetch("fund_name", self._fetch_fund_name))
-        results.append(self._safe_fetch("fund_manager", self._fetch_fund_manager))
-
-        # ===== Priority 1: Daily real-time data =====
-        results.append(self._safe_fetch("fund_daily", self._fetch_fund_daily))
-        results.append(self._safe_fetch("fund_money_daily", self._fetch_fund_money_daily))
-        results.append(self._safe_fetch("fund_financial_daily", self._fetch_fund_financial_daily))
-        results.append(self._safe_fetch("fund_etf_daily", self._fetch_fund_etf_daily))
-        results.append(self._safe_fetch("fund_lof", self._fetch_fund_lof))
-        results.append(self._safe_fetch("fund_value_estimation", self._fetch_fund_value_estimation))
-        results.append(self._safe_fetch("fund_purchase", self._fetch_fund_purchase))
-
-        # ===== Priority 2: Ranking and rating data =====
-        results.append(self._safe_fetch("fund_exchange_rank", self._fetch_fund_exchange_rank))
-        results.append(self._safe_fetch("fund_money_rank", self._fetch_fund_money_rank))
-        results.append(self._safe_fetch("fund_hk_rank", self._fetch_fund_hk_rank))
-        results.append(self._safe_fetch("fund_rating", self._fetch_fund_rating))
-        results.append(self._safe_fetch("fund_dividend_rank", self._fetch_fund_dividend_rank))
-
-        # ===== Priority 3: Dividend and split data =====
-        results.append(self._safe_fetch("fund_dividend", self._fetch_fund_dividend))
-        results.append(self._safe_fetch("fund_split", self._fetch_fund_split))
-
-        # ===== Priority 4: Index fund specific =====
-        results.append(self._safe_fetch("fund_index_info", self._fetch_fund_index_info))
-        results.append(self._safe_fetch("fund_graded_daily", self._fetch_fund_graded_daily))
-
+        results = [self.fetch_one(name) for name in self.list_tables()]
         return FetchSummary(category=self.category, results=results)
 
     def _fetch_fund_performance(self):
@@ -243,7 +288,15 @@ class FundFetcher(BaseFetcher):
         return df
 
     def _fetch_fund_manager(self):
+        import hashlib
         df = ak.fund_manager_em()
+        # akshare returns no stable manager id. Synthesize one as a 16-char
+        # hash of (name + company) so PK (manager_id, snapshot_date) is stable
+        # across days for the same manager.
+        if "姓名" in df.columns and "所属公司" in df.columns:
+            df["manager_id"] = (
+                df["姓名"].astype(str) + "|" + df["所属公司"].astype(str)
+            ).apply(lambda s: hashlib.sha1(s.encode("utf-8")).hexdigest()[:16])
         return df
 
     def _fetch_fund_daily(self):
@@ -287,8 +340,28 @@ class FundFetcher(BaseFetcher):
         return df
 
     def _fetch_fund_rating(self):
-        df = ak.fund_rating_all()
-        return df
+        import pandas as pd
+        wide = ak.fund_rating_all()
+        # akshare returns a wide frame (one row per fund with 4 rating-agency
+        # columns). The Iceberg schema is long (fund_code, snapshot_date,
+        # rating_agency) → rating. Melt here.
+        rating_cols = [c for c in ("上海证券", "招商证券", "济安金信", "晨星评级")
+                       if c in wide.columns]
+        if not rating_cols:
+            return wide
+        # akshare fund_rating_all returns 代码 + 简称 (not 基金代码/基金简称)
+        id_cols = [c for c in ("代码", "简称", "基金代码", "基金简称")
+                   if c in wide.columns]
+        long_df = wide.melt(
+            id_vars=id_cols,
+            value_vars=rating_cols,
+            var_name="rating_agency",
+            value_name="rating",
+        )
+        # Drop rows with missing rating and coerce to string (schema is String)
+        long_df = long_df.dropna(subset=["rating"])
+        long_df["rating"] = long_df["rating"].astype(str)
+        return long_df
 
     def _fetch_fund_dividend_rank(self):
         df = ak.fund_fh_rank_em()
@@ -329,3 +402,24 @@ class FundFetcher(BaseFetcher):
     def _fetch_fund_graded_daily(self):
         df = ak.fund_graded_fund_daily_em()
         return df
+
+    # === New: REITs ===
+    # fund_close_em / fund_fof_em / public_fund_REITs do not exist in current
+    # akshare (1.18.x). Keeping _fetch_fund_close_daily / _fetch_fund_fof_daily
+    # / _fetch_fund_portfolio_hold as placeholders (returning empty) so the
+    # DATA_CATALOG catalog entries don't dangle if anyone re-enables them.
+    def _fetch_fund_close_daily(self):
+        import pandas as pd
+        return pd.DataFrame()
+
+    def _fetch_fund_fof_daily(self):
+        import pandas as pd
+        return pd.DataFrame()
+
+    def _fetch_fund_reits_daily(self):
+        # akshare 1.18: reits_realtime_em covers public REITs intraday prices.
+        return ak.reits_realtime_em()
+
+    def _fetch_fund_portfolio_hold(self):
+        import pandas as pd
+        return pd.DataFrame()

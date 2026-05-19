@@ -1,7 +1,7 @@
 """Lambda handler for generating data catalog from processing results."""
 
 import json
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict
 
 from shared.utils.config import Config
@@ -105,6 +105,54 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         s3_client.upload_json(catalog, f"_catalog/{date_str}/data_catalog.json")
         s3_client.upload_json(catalog, "_catalog/latest/data_catalog.json")
         logger.info("Data catalog uploaded successfully")
+
+        # === Dual-write consistency check (raw vs Iceberg row counts) ===
+        try:
+            from shared.schemas import TABLES
+            from shared.storage.iceberg_writer import IcebergWriter
+            writer = IcebergWriter.from_glue(
+                database="fund_data_lake",
+                warehouse=f"s3://{config.s3_bucket}/{config.s3_prefix}iceberg/",
+            )
+            mismatches = []
+            for tname, spec in TABLES.items():
+                # Only check tables likely to have data written today (upsert-mode).
+                if spec.write_mode != "upsert":
+                    continue
+                raw_key = f"{config.s3_prefix}{spec.source_category}/{date_str}/{tname}.parquet"
+                try:
+                    head = s3_client.s3_client.head_object(
+                        Bucket=config.s3_bucket, Key=raw_key
+                    )
+                except Exception:
+                    continue  # raw not present; skip
+                try:
+                    table = writer.catalog.load_table(("fund_data_lake", tname))
+                    df = table.scan().to_pandas()
+                    date_col = spec.date_specs[0].target if spec.date_specs else None
+                    if date_col and date_col in df.columns:
+                        ice_count = int(
+                            (df[date_col] == date.fromisoformat(date_str)).sum()
+                        )
+                    else:
+                        ice_count = len(df)
+                    raw_size = head["ContentLength"]
+                    if raw_size > 0 and ice_count == 0:
+                        mismatches.append({
+                            "table": tname, "raw_size": raw_size,
+                            "iceberg_rows": ice_count,
+                        })
+                except Exception as e:
+                    mismatches.append({"table": tname, "error": str(e)})
+            catalog["consistency_check"] = {
+                "checked_tables": len(TABLES),
+                "mismatches": mismatches,
+            }
+            if mismatches:
+                logger.warning(f"Dual-write mismatches: {mismatches}")
+        except Exception as e:
+            logger.exception("Consistency check failed (non-fatal)")
+            catalog["consistency_check"] = {"error": str(e)}
 
         elapsed = (datetime.now() - start_time).total_seconds()
 
