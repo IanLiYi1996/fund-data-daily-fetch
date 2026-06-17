@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -70,8 +71,10 @@ for _candidate in (_here.parent, _here / "..", Path("lambda")):
 from shared.storage.iceberg_writer import IcebergWriter  # noqa: E402
 
 
-DEFAULT_BUCKET = "fsi-investmentadvisory-data-463470973226-us-east-1"
-DEFAULT_S3_PREFIX = "fund-data-pipeline/"
+DEFAULT_BUCKET = os.environ.get(
+    "S3_BUCKET", "fund-data-pipeline-463470973226-us-east-1"
+)
+DEFAULT_S3_PREFIX = os.environ.get("S3_PREFIX", "fund-data-pipeline/")
 DEFAULT_PROGRESS = Path.home() / ".cache" / "fund_backfill_progress.json"
 
 _S3_URI_PREFIX = "s3://"

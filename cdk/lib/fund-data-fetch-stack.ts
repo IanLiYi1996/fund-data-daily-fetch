@@ -40,12 +40,71 @@ export class FundDataFetchStack extends Stack {
 
     const lambdaDir = path.join(__dirname, "../../lambda");
 
-    // ========== S3 Bucket (existing, shared with investment-advisory) ==========
+    // ========== S3 Bucket (owned by this stack) ==========
+    //
+    // The pipeline previously used a bucket owned by an unrelated stack
+    // (InvestmentAdvisory). When that stack was torn down on 2026-06-12 the
+    // data bucket — and the entire data lake — went with it. Owning the
+    // bucket here makes the lifecycle of data and pipeline align: deleting
+    // FundDataFetchStack is the only path that drops the bucket, and even
+    // then RemovalPolicy.RETAIN forces a manual confirm.
+    //
+    // The bucket itself is the source of truth for replication into
+    // Mengxin's account. We re-attach the same replication-role ARN that
+    // the destination-side bucket policy in financial-dataset-mx already
+    // trusts, so no cross-account changes are required.
 
     const bucketName =
-      props?.bucketName ?? `fsi-investmentadvisory-data-${this.account}-${this.region}`;
+      props?.bucketName ?? `fund-data-pipeline-${this.account}-${this.region}`;
     const s3Prefix = props?.s3Prefix ?? "fund-data-pipeline/";
-    this.bucket = s3.Bucket.fromBucketName(this, "FundDataBucket", bucketName);
+
+    const replicationRole = iam.Role.fromRoleArn(
+      this,
+      "ReplicationRoleToMengxin",
+      `arn:aws:iam::${this.account}:role/s3-replication-to-financial-dataset-mx`,
+      { mutable: false }
+    );
+    const mengxinDestination = s3.Bucket.fromBucketAttributes(
+      this,
+      "MengxinDestinationBucket",
+      {
+        bucketName: "financial-dataset-mx",
+        account: "845861764576",
+        region: "us-east-1",
+      }
+    );
+
+    const replicatedPrefixes = [
+      "data/",
+      `${s3Prefix}fund/`,
+      `${s3Prefix}stock/`,
+      `${s3Prefix}macro/`,
+      `${s3Prefix}a_share/`,
+      `${s3Prefix}hk_stock/`,
+      `${s3Prefix}us_stock/`,
+      `${s3Prefix}hist_kline/`,
+      `${s3Prefix}hist_kline_indicators/`,
+      `${s3Prefix}fund_history/`,
+    ];
+
+    const dataBucket = new s3.Bucket(this, "FundDataBucket", {
+      bucketName,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      versioned: true,
+      removalPolicy: RemovalPolicy.RETAIN,
+      autoDeleteObjects: false,
+      replicationRole,
+      replicationRules: replicatedPrefixes.map((prefix, i) => ({
+        id: `replicate-${prefix.replace(/\W+/g, "-").replace(/-+$/, "")}`,
+        destination: mengxinDestination,
+        accessControlTransition: true,
+        priority: i + 1,
+        deleteMarkerReplication: false,
+        filter: { prefix },
+      })),
+    });
+    this.bucket = dataBucket;
 
     // ========== Glue Catalog ==========
     const FUND_DATA_LAKE_DB = "fund_data_lake";
