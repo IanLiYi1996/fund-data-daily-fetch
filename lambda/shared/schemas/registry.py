@@ -89,7 +89,13 @@ TABLES: dict[str, TableSpec] = {
         schema=_fund_daily_schema,
         partition_spec=_fund_daily_partition,
         identifier_fields=["fund_code", "trade_date"],
-        write_mode="upsert",
+        # Append-only: pyiceberg upsert on a ~30M-row table reads the full
+        # table to dedup, which routinely exceeds the 900s Lambda hard cap
+        # (and SIGSEGVs intermittently). Daily fetches add one new
+        # trade_date per fund, so duplicates only arise from same-day
+        # reruns. Weekly compaction in iceberg-maintenance dedups on
+        # (fund_code, trade_date) and cleans those up.
+        write_mode="append",
         source_category="fund",
         date_specs=[
             DateColumnSpec(["净值日期", "交易日"], "trade_date", "date"),
