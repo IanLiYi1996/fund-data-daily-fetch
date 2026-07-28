@@ -235,6 +235,21 @@ export class FundDataFetchStack extends Stack {
       lambdaEnv
     );
 
+    // Fallback: after fund_daily is written, re-check which fund_codes in
+    // the fund_name universe are still missing today's row and hit the
+    // 天天基金 REST API. Recovers money-market funds, back-end share
+    // classes, and periodic-open funds that akshare's snapshot endpoints
+    // don't cover on all days.
+    const fundFallbackLambda = this.createDockerLambda(
+      "FundFallbackLambda",
+      lambdaDir,
+      "fund-fallback-fetcher/Dockerfile",
+      "Fill gaps in fund_daily via 天天基金 REST API (post fund-fetcher)",
+      2048,
+      15,
+      lambdaEnv
+    );
+
     // Grant S3 access scoped to {bucket}/{s3Prefix}* (not the whole shared bucket).
     const listBucketPolicy = new iam.PolicyStatement({
       actions: ["s3:ListBucket", "s3:GetBucketLocation"],
@@ -264,6 +279,7 @@ export class FundDataFetchStack extends Stack {
       catalogLambda,
       exportFundHistoryLambda,
       fundHistoryFetchLambda,
+      fundFallbackLambda,
     ].forEach((fn) => {
       fn.addToRolePolicy(listBucketPolicy);
       fn.addToRolePolicy(objectPolicy);
@@ -297,6 +313,7 @@ export class FundDataFetchStack extends Stack {
       usStockFetchLambda,
       histKlineFetchLambda,
       catalogLambda,
+      fundFallbackLambda,
     ].forEach((fn) => fn.addToRolePolicy(icebergGluePolicy));
 
     // ========== Iceberg Maintenance Lambda ==========
@@ -325,6 +342,7 @@ export class FundDataFetchStack extends Stack {
       histKlineFetchLambda,
       icebergMaintenanceLambda,
       catalogLambda,
+      fundFallbackLambda,
     ];
     icebergClients.forEach((fn) => fn.node.addDependency(glueDatabase));
 
@@ -383,11 +401,37 @@ export class FundDataFetchStack extends Stack {
     });
     fundMap.itemProcessor(fundPartitionTask);
 
+    // After all 21 fund partitions complete, run the fallback fetcher to
+    // fill any funds that were still missing today's fund_daily row
+    // (typically money-market funds and back-end share classes that
+    // akshare's snapshot endpoints don't cover).
+    const fundFallbackTask = new tasks.LambdaInvoke(
+      this,
+      "InvokeFundFallback",
+      {
+        lambdaFunction: fundFallbackLambda,
+        retryOnServiceExceptions: true,
+        payloadResponseOnly: true,
+        resultPath: "$.fund_fallback",
+        comment: "Fill fund_daily gaps via 天天基金 REST API",
+      }
+    ).addCatch(
+      new sfn.Pass(this, "FundFallbackFailed", {
+        resultPath: "$.fund_fallback",
+        result: sfn.Result.fromObject({
+          downloader: "fund-fallback",
+          success: false,
+          error: "Lambda invocation failed",
+        }),
+      }),
+      { errors: ["States.ALL"], resultPath: "$.fund_fallback" }
+    );
+
     const fundBranch = new sfn.Pass(this, "FundSeed", {
       result: sfn.Result.fromObject({
         fund_partitions: FUND_TABLES.map((table) => ({ table })),
       }),
-    }).next(fundMap);
+    }).next(fundMap).next(fundFallbackTask);
 
     parallelCollection.branch(fundBranch);
 
