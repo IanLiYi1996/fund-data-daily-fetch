@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY shared/ /app/shared/
 COPY backfill-runner/entrypoint.sh /app/entrypoint.sh
 COPY backfill-runner/backfill_fund_history.py /app/backfill_fund_history.py
+COPY backfill-runner/backfill_portfolio_hold.py /app/backfill_portfolio_hold.py
 
 RUN chmod +x /app/entrypoint.sh
 
