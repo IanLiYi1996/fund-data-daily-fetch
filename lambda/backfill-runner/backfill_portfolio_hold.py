@@ -252,7 +252,58 @@ def main() -> int:
 
     print(f"\nDONE ok={ok} empty={empty} rows={total_rows} "
           f"elapsed={time.time()-t0:.0f}s", flush=True)
+
+    _export_flat_parquet(args.warehouse)
     return 0
+
+
+def _export_flat_parquet(warehouse: str) -> None:
+    """Dedup + write flat parquet under fund/_history/ so it replicates
+    to financial-dataset-mx alongside fund_manager_history /
+    fund_scale_history. This is the file Mengxin's team reads directly.
+    """
+    import tempfile
+    import boto3
+    import duckdb
+
+    bucket = DEFAULT_BUCKET
+    prefix = DEFAULT_S3_PREFIX  # "fund-data-pipeline/"
+    key = f"{prefix}fund/_history/fund_portfolio_hold_history.parquet"
+    src_glob = f"s3://{bucket}/{prefix}iceberg/fund_data_lake.db/fund_portfolio_hold/data/**/*.parquet"
+
+    print(f"\nExporting flat parquet → s3://{bucket}/{key}", flush=True)
+    con = duckdb.connect()
+    con.sql(f"CREATE SECRET s3 (TYPE s3, PROVIDER credential_chain, REGION '{DEFAULT_REGION}');")
+
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+        tmp = f.name
+    try:
+        con.sql(f"""
+            COPY (
+                WITH ranked AS (
+                    SELECT *, row_number() OVER (
+                        PARTITION BY fund_code, report_date, holding_code
+                        ORDER BY report_date DESC
+                    ) AS rn
+                    FROM read_parquet('{src_glob}')
+                )
+                SELECT fund_code, report_date, holding_code, holding_name,
+                       weight_pct, shares, market_value
+                FROM ranked WHERE rn = 1
+            ) TO '{tmp}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+        """)
+        rows = con.sql(f"SELECT count(*) FROM read_parquet('{tmp}')").fetchone()[0]
+        funds = con.sql(f"SELECT count(DISTINCT fund_code) FROM read_parquet('{tmp}')").fetchone()[0]
+        size = os.path.getsize(tmp)
+        print(f"  {rows:,} rows / {funds:,} funds / {size:,} bytes", flush=True)
+
+        boto3.client("s3", region_name=DEFAULT_REGION).upload_file(tmp, bucket, key)
+        print(f"  uploaded: s3://{bucket}/{key}", flush=True)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
