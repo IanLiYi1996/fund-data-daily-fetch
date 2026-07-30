@@ -162,7 +162,7 @@ graph TB
 
 - EventBridge cron 每季度末次月 25 日 20:00 UTC 触发（~3 周披露 buffer）。
 - 任务通过 `--mode portfolio` 参数分派到 `backfill_portfolio_hold.py`。
-- **幂等 resume**：脚本启动时读一次目标 Iceberg 表的 `fund_code` 集合，跳过已有；崩溃重启只补差集。
+- **按季度粒度幂等**：脚本启动时读目标 Iceberg 表**在当季 `report_date` 上**的 `fund_code` 集合，跳过已有；只有缺当季披露的基金会被再拉一次。历史季度是稳定披露，一旦有行就冻结。首次全量 backfill 后，后续每季 wall-clock 从 ~15h 缩到 ~2-3h。
 - **过滤 equity-like universe**：从 27k universe 里剔除掉命名含 `债/货币/REITs` 的（这些没有股票持仓），把 API 调用量降到 19k → 命中率 ~78%。
 - **末尾自动 export** 扁平 parquet 到 `fund/_history/fund_portfolio_hold_history.parquet`，走复制规则同步给消费方——**不需要下游装 Iceberg**。
 
@@ -238,6 +238,5 @@ graph LR
 
 ## 待确认的开放问题
 
-- **fund_portfolio_hold 增量刷新**：现在每季度全量重跑 15h，浪费在已披露基金上。方向：只拉当季度未披露的 fund_code，其他跳过——需要一个"上次跑到哪"的 watermark 表。
 - **QDII / 海外主题基金替代数据源**：能不能通过 Wind / 天天基金**其他端点**取到 QDII 特殊份额的历史？需要 spike 验证。
 - **消费方查询模式对齐**：目前只提供 flat parquet 月度切片；如果消费方以后按 fund_code 时序访问，是否重新分区（例如 `fund_code_hash=NN/`）？
