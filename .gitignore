@@ -64,3 +64,9 @@ pip-log.txt
 
 # Reference code (for development only)
 reference/
+
+# industry-assets-stack machine-local install
+.claude/skills/
+.agents/
+skills-lock.json
+scripts/autonomous.conf
