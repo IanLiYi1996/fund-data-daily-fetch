@@ -81,6 +81,19 @@ def _format_alarm(alarm: Dict[str, Any]) -> str:
     label = _ALARM_LABELS.get(name, name)
     emoji = _STATE_EMOJI.get(state, "❓")
 
+    # Drill messages must be unmistakable. Publishing a payload shaped
+    # exactly like a real alarm (to exercise the real path) produced a
+    # message indistinguishable from an outage, which is worse than not
+    # testing. Callers set "Drill": true to opt into the marked format.
+    if alarm.get("Drill"):
+        lines = [
+            "🧪 *[演练] fund-data 告警通道测试 — 非真实故障*",
+            f"模拟对象: {label}",
+        ]
+        if reason:
+            lines.append(f"备注: {reason}")
+        return "\n".join(lines)
+
     lines = [
         f"{emoji} *fund-data 管道告警* — {label}",
         f"状态: `{state}`",
