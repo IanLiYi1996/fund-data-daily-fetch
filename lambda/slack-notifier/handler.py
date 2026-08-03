@@ -54,14 +54,18 @@ _ALARM_LABELS = {
 
 _STATE_EMOJI = {"ALARM": "🔴", "OK": "✅", "INSUFFICIENT_DATA": "⚠️"}
 
-# The Slack Workflow trigger declares exactly one variable, `Content`
-# (case-sensitive) — confirmed by probing: payloads keyed `Content` land in
-# the channel, while `content` / `text` / `message` make Slack report
-# "there's a problem with the workflow's setup". Overridable in case the
-# workflow is later rebuilt with a different variable name.
+# The Slack Workflow trigger declares one variable, currently `text`.
+#
+# Note the trigger returns ok:true no matter what you send, so HTTP 200 is
+# NOT evidence of delivery — a wrong key (or a dangling variable reference
+# in the workflow's send-message step) only shows up as "there's a problem
+# with the workflow's setup" inside Slack. Always confirm a test message
+# actually appeared in the channel. Rotating the webhook rebuilds the
+# variable and breaks the send-message step's binding, so after any
+# rotation the workflow's second step must be re-pointed at the variable.
 _PAYLOAD_KEYS = [
     k.strip()
-    for k in os.environ.get("SLACK_PAYLOAD_KEYS", "Content").split(",")
+    for k in os.environ.get("SLACK_PAYLOAD_KEYS", "text").split(",")
     if k.strip()
 ]
 

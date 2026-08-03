@@ -69,10 +69,11 @@ MIN_FUNDS = int(os.environ.get("MIN_FUNDS", "20000"))
 MAX_EXPORT_LAG_HOURS = int(os.environ.get("MAX_EXPORT_LAG_HOURS", "30"))
 
 
-# See slack-notifier/handler.py — the workflow's only variable is `Content`.
+# See slack-notifier/handler.py — the workflow's only variable is `text`,
+# and HTTP 200 from the trigger does not prove the message was delivered.
 _PAYLOAD_KEYS = [
     k.strip()
-    for k in os.environ.get("SLACK_PAYLOAD_KEYS", "Content").split(",")
+    for k in os.environ.get("SLACK_PAYLOAD_KEYS", "text").split(",")
     if k.strip()
 ]
 
