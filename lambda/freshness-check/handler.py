@@ -53,8 +53,19 @@ MIN_FUNDS = int(os.environ.get("MIN_FUNDS", "20000"))
 MAX_EXPORT_LAG_HOURS = int(os.environ.get("MAX_EXPORT_LAG_HOURS", "30"))
 
 
+_PAYLOAD_KEYS = [
+    k.strip()
+    for k in os.environ.get(
+        "SLACK_PAYLOAD_KEYS", "Content,content,text,message,Message"
+    ).split(",")
+    if k.strip()
+]
+
+
 def _post(text: str) -> None:
-    body = json.dumps({"Content": text}).encode("utf-8")
+    # See slack-notifier/handler.py: the Workflow trigger returns ok:true
+    # even when no declared variable matched, so send every plausible key.
+    body = json.dumps({k: text for k in _PAYLOAD_KEYS}).encode("utf-8")
     req = urllib.request.Request(
         WEBHOOK_URL, data=body,
         headers={"Content-Type": "application/json"}, method="POST",

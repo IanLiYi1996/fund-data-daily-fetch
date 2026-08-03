@@ -35,9 +35,29 @@ _ALARM_LABELS = {
 
 _STATE_EMOJI = {"ALARM": "🔴", "OK": "✅", "INSUFFICIENT_DATA": "⚠️"}
 
+# Variable names a Slack Workflow webhook trigger might declare for the
+# message body. Override with SLACK_PAYLOAD_KEYS (comma-separated) once the
+# actual name is confirmed in the Slack UI.
+_PAYLOAD_KEYS = [
+    k.strip()
+    for k in os.environ.get(
+        "SLACK_PAYLOAD_KEYS", "Content,content,text,message,Message"
+    ).split(",")
+    if k.strip()
+]
+
+
+def _payload(text: str) -> Dict[str, str]:
+    return {k: text for k in _PAYLOAD_KEYS}
+
 
 def _post(text: str) -> int:
-    body = json.dumps({"Content": text}).encode("utf-8")
+    # Slack Workflow triggers accept any JSON and return ok:true regardless
+    # of whether the declared variables matched, so a name mismatch shows up
+    # only as "there's a problem with the workflow's setup" INSIDE Slack.
+    # Send the same text under every plausible variable name — unreferenced
+    # keys are ignored by the trigger, so this is a no-cost hedge.
+    body = json.dumps(_payload(text)).encode("utf-8")
     req = urllib.request.Request(
         WEBHOOK_URL,
         data=body,
