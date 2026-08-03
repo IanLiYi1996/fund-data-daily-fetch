@@ -9,21 +9,40 @@ Two entry shapes:
    freshness-check path and for ad-hoc notification from other Lambdas.
 
 The webhook is a Slack Workflow trigger, so the payload key is
-``Content`` (not the usual ``text`` of an Incoming Webhook).
+``Content`` (not the usual ``text`` of an Incoming Webhook). The URL
+itself is read from Secrets Manager — it is a credential.
 """
 from __future__ import annotations
 
 import json
 import os
 import urllib.request
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+
+import boto3
 
 from shared.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
 REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+
+_SECRET_ARN = os.environ["SLACK_WEBHOOK_SECRET_ARN"]
+_webhook_cache: Optional[str] = None
+
+
+def _webhook_url() -> str:
+    """Resolve the Slack webhook from Secrets Manager, cached per container.
+
+    The URL is a credential (anyone holding it can post to the channel), so
+    it is never baked into source or Lambda env vars.
+    """
+    global _webhook_cache
+    if _webhook_cache is None:
+        client = boto3.client("secretsmanager", region_name=REGION)
+        _webhook_cache = client.get_secret_value(SecretId=_SECRET_ARN)["SecretString"].strip()
+    return _webhook_cache
 
 # CloudWatch alarm name → human-readable Chinese label, so the Slack
 # message says what actually broke rather than a CFN-ish identifier.
@@ -58,7 +77,7 @@ def _post(text: str) -> int:
     # of delivery; the key name has to be right.
     body = json.dumps(_payload(text)).encode("utf-8")
     req = urllib.request.Request(
-        WEBHOOK_URL,
+        _webhook_url(),
         data=body,
         headers={"Content-Type": "application/json"},
         method="POST",

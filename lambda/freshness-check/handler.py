@@ -29,7 +29,7 @@ import json
 import os
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import boto3
 from pyiceberg.catalog import load_catalog
@@ -42,8 +42,24 @@ logger = get_logger(__name__)
 BUCKET = os.environ["S3_BUCKET"]
 S3_PREFIX = os.environ.get("S3_PREFIX", "fund-data-pipeline/")
 WAREHOUSE = os.environ["WAREHOUSE_PATH"]
-WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
 REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+
+_SECRET_ARN = os.environ["SLACK_WEBHOOK_SECRET_ARN"]
+_webhook_cache: Optional[str] = None
+
+
+def _webhook_url() -> str:
+    """Resolve the Slack webhook from Secrets Manager, cached per container.
+
+    The URL is a credential (anyone holding it can post to the channel), so
+    it is never baked into source or Lambda env vars.
+    """
+    global _webhook_cache
+    if _webhook_cache is None:
+        client = boto3.client("secretsmanager", region_name=REGION)
+        _webhook_cache = client.get_secret_value(SecretId=_SECRET_ARN)["SecretString"].strip()
+    return _webhook_cache
 
 # A-share holidays can stack up to 4 non-trading days (国庆/春节 run
 # longer, but those windows also stall the upstream so alerting is
@@ -64,7 +80,7 @@ _PAYLOAD_KEYS = [
 def _post(text: str) -> None:
     body = json.dumps({k: text for k in _PAYLOAD_KEYS}).encode("utf-8")
     req = urllib.request.Request(
-        WEBHOOK_URL, data=body,
+        _webhook_url(), data=body,
         headers={"Content-Type": "application/json"}, method="POST",
     )
     with urllib.request.urlopen(req, timeout=15) as resp:

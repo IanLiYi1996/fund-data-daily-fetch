@@ -17,6 +17,7 @@ import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as glue from "aws-cdk-lib/aws-glue";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as sns from "aws-cdk-lib/aws-sns";
+import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as subscriptions from "aws-cdk-lib/aws-sns-subscriptions";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import * as cloudwatchActions from "aws-cdk-lib/aws-cloudwatch-actions";
@@ -30,11 +31,12 @@ export interface FundDataFetchStackProps extends StackProps {
   bucketName?: string;
   s3Prefix?: string;
   /**
-   * Slack Workflow webhook that alarms and the freshness check post to.
-   * Overridable via `-c slackWebhookUrl=...`; falls back to the shared
-   * fund-data channel trigger.
+   * Secrets Manager secret holding the Slack Workflow webhook URL that
+   * alarms and the freshness check post to. Defaults to
+   * `fund-data/slack-webhook`. The URL is a credential and must never be
+   * committed.
    */
-  slackWebhookUrl?: string;
+  slackWebhookSecretName?: string;
 }
 
 export class FundDataFetchStack extends Stack {
@@ -46,12 +48,20 @@ export class FundDataFetchStack extends Stack {
 
     const lambdaDir = path.join(__dirname, "../../lambda");
 
-    // Slack Workflow trigger for the fund-data channel. Not a secret in
-    // the credential sense (it only accepts posts), but overridable per
-    // deploy so a fork can point at its own channel.
-    const slackWebhookUrl =
-      props?.slackWebhookUrl ??
-      "https://hooks.slack.com/triggers/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";
+    // Slack Workflow trigger for the fund-data channel. This URL IS a
+    // credential — anyone holding it can post into the channel — so it
+    // lives in Secrets Manager and never in source. An earlier revision
+    // hardcoded it here and GitHub secret scanning caught it on a public
+    // repo; that webhook has been revoked.
+    //
+    // Bootstrap once per account:
+    //   aws secretsmanager create-secret --name fund-data/slack-webhook \\
+    //     --secret-string '<workflow trigger URL>'
+    const slackWebhookSecret = secretsmanager.Secret.fromSecretNameV2(
+      this,
+      "SlackWebhookSecret",
+      props?.slackWebhookSecretName ?? "fund-data/slack-webhook"
+    );
 
     // ========== S3 Bucket (owned by this stack) ==========
     //
@@ -925,11 +935,12 @@ export class FundDataFetchStack extends Stack {
       "Forward CloudWatch alarms + pipeline events to Slack",
       512,
       1,
-      { ...lambdaEnv, SLACK_WEBHOOK_URL: slackWebhookUrl }
+      { ...lambdaEnv, SLACK_WEBHOOK_SECRET_ARN: slackWebhookSecret.secretArn }
     );
     alertTopic.addSubscription(
       new subscriptions.LambdaSubscription(slackNotifierLambda)
     );
+    slackWebhookSecret.grantRead(slackNotifierLambda);
 
     // ========== Data freshness gate ==========
     //
@@ -946,7 +957,7 @@ export class FundDataFetchStack extends Stack {
       "Assert fund_daily freshness + export replication, alert to Slack",
       1024,
       5,
-      { ...lambdaEnv, SLACK_WEBHOOK_URL: slackWebhookUrl }
+      { ...lambdaEnv, SLACK_WEBHOOK_SECRET_ARN: slackWebhookSecret.secretArn }
     );
 
     // 19:00 UTC — two hours after the 17:00 daily workflow starts, so a
@@ -968,6 +979,7 @@ export class FundDataFetchStack extends Stack {
     freshnessCheckLambda.addToRolePolicy(objectPolicy);
     freshnessCheckLambda.addToRolePolicy(icebergGluePolicy);
     freshnessCheckLambda.node.addDependency(glueDatabase);
+    slackWebhookSecret.grantRead(freshnessCheckLambda);
 
     // ========== CloudWatch Alarms ==========
 

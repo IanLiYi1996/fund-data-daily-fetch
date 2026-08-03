@@ -8,11 +8,12 @@ const app = new cdk.App();
 // Alerting config. Both channels are wired by default so an alarm can
 // never publish into an empty topic again (which is exactly why the
 // 2026-07-29 → 08-02 outage went unnoticed for five days).
-//   -c alertEmail=...       override the email subscriber
-//   -c slackWebhookUrl=...  override the Slack Workflow trigger
+//   -c alertEmail=...              override the email subscriber
+//   -c slackWebhookSecretName=...   override the Secrets Manager secret
+//                                   holding the Slack webhook URL
 const alertEmail =
   app.node.tryGetContext("alertEmail") ?? "ianleely@amazon.com";
-const slackWebhookUrl = app.node.tryGetContext("slackWebhookUrl");
+const slackWebhookSecretName = app.node.tryGetContext("slackWebhookSecretName");
 
 new FundDataFetchStack(app, "FundDataFetchStack", {
   env: {
@@ -21,7 +22,7 @@ new FundDataFetchStack(app, "FundDataFetchStack", {
   },
   description: "Fund Data Daily Fetch System - S3 + Lambda + EventBridge",
   alertEmail,
-  slackWebhookUrl,
+  slackWebhookSecretName,
 });
 
 app.synth();
