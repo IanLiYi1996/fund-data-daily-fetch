@@ -12,8 +12,9 @@ classes, and periodic-open funds whose disclosure date isn't today.
 
 Event:
     {"trade_date": "2026-06-16"}   # optional; defaults to today
-    {"lookback_days": 5}           # optional; also fills gap for the
-                                   # N previous trading days (default 3)
+    {"lookback_days": 5}           # optional; how far back to look for
+                                   # a disclosure (default 14, override
+                                   # with FALLBACK_LOOKBACK_DAYS)
 
 Idempotent: fund_daily is append-mode; weekly compaction dedups.
 """
@@ -115,7 +116,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     end_date = (
         date.fromisoformat(end_date_str) if end_date_str else date.today()
     )
-    lookback = int(event.get("lookback_days", 3))
+    # 3 days was too tight. Periodic-open funds (3/6-month-hold FOF, some
+    # 定开债) disclose on their own cadence, so a fund whose latest NAV is
+    # 10 days old still counts as "missing" every single day while the
+    # window never reaches its disclosure date. Measured on the 2026-08-03
+    # gap of 714 codes: 36 of them (34 FOF + 2 定开债) were sitting in
+    # lsjz the whole time, just outside a 3-day window. 14 days covers a
+    # quarterly-hold fund's gap between disclosures without pulling so
+    # much history that the run slows down.
+    lookback = int(event.get("lookback_days", os.environ.get("FALLBACK_LOOKBACK_DAYS", "14")))
     start_date = end_date - timedelta(days=lookback)
 
     logger.info(
