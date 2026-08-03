@@ -29,6 +29,12 @@ export interface FundDataFetchStackProps extends StackProps {
   alertEmail?: string;
   bucketName?: string;
   s3Prefix?: string;
+  /**
+   * Slack Workflow webhook that alarms and the freshness check post to.
+   * Overridable via `-c slackWebhookUrl=...`; falls back to the shared
+   * fund-data channel trigger.
+   */
+  slackWebhookUrl?: string;
 }
 
 export class FundDataFetchStack extends Stack {
@@ -39,6 +45,13 @@ export class FundDataFetchStack extends Stack {
     super(scope, id, props);
 
     const lambdaDir = path.join(__dirname, "../../lambda");
+
+    // Slack Workflow trigger for the fund-data channel. Not a secret in
+    // the credential sense (it only accepts posts), but overridable per
+    // deploy so a fork can point at its own channel.
+    const slackWebhookUrl =
+      props?.slackWebhookUrl ??
+      "https://hooks.slack.com/triggers/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";
 
     // ========== S3 Bucket (owned by this stack) ==========
     //
@@ -898,6 +911,63 @@ export class FundDataFetchStack extends Stack {
         new subscriptions.EmailSubscription(props.alertEmail)
       );
     }
+
+    // ========== Slack alerting ==========
+    //
+    // The topic had ZERO subscribers until now: alertEmail was never
+    // passed, so every alarm that fired (including the 2026-07-29 →
+    // 08-02 workflow outage) published into the void. Subscribe a
+    // notifier Lambda so alarms reach a human channel by default.
+    const slackNotifierLambda = this.createDockerLambda(
+      "SlackNotifierLambda",
+      lambdaDir,
+      "slack-notifier/Dockerfile",
+      "Forward CloudWatch alarms + pipeline events to Slack",
+      512,
+      1,
+      { ...lambdaEnv, SLACK_WEBHOOK_URL: slackWebhookUrl }
+    );
+    alertTopic.addSubscription(
+      new subscriptions.LambdaSubscription(slackNotifierLambda)
+    );
+
+    // ========== Data freshness gate ==========
+    //
+    // Alarms above only watch the workflow's OWN Failed/TimedOut
+    // metrics. The 2026-06-12 bucket deletion produced SUCCEEDED
+    // executions that wrote nowhere, so those metrics stayed at 0 and
+    // no alarm could fire. This check asserts the consumer-visible
+    // contract instead (is fund_daily fresh, did the export replicate)
+    // and runs on its own schedule, independent of workflow status.
+    const freshnessCheckLambda = this.createDockerLambda(
+      "FreshnessCheckLambda",
+      lambdaDir,
+      "freshness-check/Dockerfile",
+      "Assert fund_daily freshness + export replication, alert to Slack",
+      1024,
+      5,
+      { ...lambdaEnv, SLACK_WEBHOOK_URL: slackWebhookUrl }
+    );
+
+    // 19:00 UTC — two hours after the 17:00 daily workflow starts, so a
+    // normal run (12-22 min) has long finished and a hung one is late
+    // enough to be worth flagging.
+    const freshnessRule = new events.Rule(this, "FreshnessCheckSchedule", {
+      ruleName: "FundDataFreshnessCheck",
+      description:
+        "Daily consumer-contract check (fund_daily lag + export replication) at 19:00 UTC",
+      schedule: events.Schedule.cron({ minute: "0", hour: "19" }),
+    });
+    freshnessRule.addTarget(
+      new targets.LambdaFunction(freshnessCheckLambda)
+    );
+
+    // freshness-check reads fund_daily via the Glue catalog and heads the
+    // export object, so it needs the same S3 + Glue grants as the fetchers.
+    freshnessCheckLambda.addToRolePolicy(listBucketPolicy);
+    freshnessCheckLambda.addToRolePolicy(objectPolicy);
+    freshnessCheckLambda.addToRolePolicy(icebergGluePolicy);
+    freshnessCheckLambda.node.addDependency(glueDatabase);
 
     // ========== CloudWatch Alarms ==========
 
