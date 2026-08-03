@@ -29,6 +29,7 @@ import sys
 import time
 from datetime import date
 from pathlib import Path
+from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -55,6 +56,7 @@ for _cand in (_here.parent, _here / "..", Path("lambda"), Path("/app")):
         break
 from shared.storage.iceberg_writer import IcebergWriter  # noqa: E402
 from pyiceberg.catalog import load_catalog  # noqa: E402
+from pyiceberg.expressions import EqualTo  # noqa: E402
 
 
 DEFAULT_BUCKET = os.environ.get(
@@ -152,20 +154,60 @@ def _build_universe(warehouse: str) -> pd.DataFrame:
     return equity[["fund_code", "fund_name"]].reset_index(drop=True)
 
 
-def _load_done_set(catalog, table_name: str) -> set[str]:
-    """Return the set of fund_codes already present in the target table.
+def _load_done_set(
+    catalog, table_name: str, target_quarter: Optional[date] = None,
+) -> set[str]:
+    """Return the set of fund_codes already loaded for the target quarter.
 
-    Used for resume: rerunning after a partial run only fetches the codes
-    that haven't landed anything yet. Once a code has any row, it's not
-    re-fetched — season updates get handled by force-refresh flag if
-    needed later.
+    Historical quarters are stable disclosures — once a fund_code has
+    landed a row for a given `report_date`, that pair is frozen. The
+    only interesting resume-skip is per-quarter: codes that already have
+    a row for the newest quarter don't need re-fetching, but codes only
+    seen in older quarters DO (they may have disclosed the new quarter).
+
+    When ``target_quarter`` is None (legacy behavior), skip any code
+    with any row.
     """
     try:
         tbl = catalog.load_table(("fund_data_lake", table_name))
-        codes = tbl.scan(selected_fields=("fund_code",)).to_arrow().to_pandas()
+        if target_quarter is None:
+            codes = tbl.scan(
+                selected_fields=("fund_code",),
+            ).to_arrow().to_pandas()
+        else:
+            codes = tbl.scan(
+                row_filter=EqualTo("report_date", target_quarter),
+                selected_fields=("fund_code",),
+            ).to_arrow().to_pandas()
         return set(codes.fund_code.unique())
     except Exception:
         return set()
+
+
+def _resolve_target_quarter(spec: Optional[str]) -> date:
+    """Return the report_date (quarter-end) implied by ``spec`` or today.
+
+    ``spec`` accepts ``YYYY-QN`` (e.g. ``2026-Q3``). Absent, we pick the
+    most recent quarter whose disclosure window has opened — the
+    quarterly EventBridge rule runs on the 25th of Jan/Apr/Jul/Oct, so
+    on those dates the previous quarter's disclosures have finished.
+    """
+    if spec:
+        m = re.match(r"^(\d{4})-?[Qq]([1-4])$", spec)
+        if not m:
+            raise ValueError(f"invalid --target-quarter: {spec}")
+        y, q = int(m.group(1)), int(m.group(2))
+        return _QUARTER_END[(y, q)]
+
+    today = date.today()
+    year = today.year
+    if today.month <= 3:
+        return _QUARTER_END[(year - 1, 4)]
+    if today.month <= 6:
+        return _QUARTER_END[(year, 1)]
+    if today.month <= 9:
+        return _QUARTER_END[(year, 2)]
+    return _QUARTER_END[(year, 3)]
 
 
 def main() -> int:
@@ -181,10 +223,29 @@ def main() -> int:
                    help="Cap total funds processed (0=all)")
     p.add_argument("--force", action="store_true",
                    help="Ignore resume set and re-fetch every fund")
+    p.add_argument("--target-quarter", default=None,
+                   help=("Quarter to refresh, e.g. '2026-Q3'. Resume skips "
+                         "fund_codes that already have a row for this quarter; "
+                         "codes missing only THIS quarter's disclosure get "
+                         "re-fetched even if older rows are present. Default: "
+                         "derive from today (last quarter whose window has "
+                         "opened). Pass '--target-quarter all' to fall back "
+                         "to full-universe backfill semantics."))
     args = p.parse_args()
+
+    if args.target_quarter and args.target_quarter.lower() == "all":
+        target_quarter: Optional[date] = None
+        print("target_quarter: (full history)", flush=True)
+    else:
+        target_quarter = _resolve_target_quarter(args.target_quarter)
+        print(f"target_quarter: {target_quarter}", flush=True)
 
     if args.years:
         years = [int(x.strip()) for x in args.years.split(",") if x.strip()]
+    elif target_quarter is not None:
+        # Only the year containing the target quarter needs to be fetched;
+        # older quarters are stable and already in the table.
+        years = [target_quarter.year]
     else:
         cur = date.today().year
         years = [cur, cur - 1]
@@ -197,8 +258,11 @@ def main() -> int:
         "type": "glue", "glue.region": DEFAULT_REGION,
         "warehouse": args.warehouse,
     })
-    done = set() if args.force else _load_done_set(catalog, "fund_portfolio_hold")
-    print(f"already loaded (skip): {len(done):,}", flush=True)
+    done = (
+        set() if args.force
+        else _load_done_set(catalog, "fund_portfolio_hold", target_quarter)
+    )
+    print(f"already loaded for target (skip): {len(done):,}", flush=True)
 
     todo = universe[~universe.fund_code.isin(done)]
     if args.limit:
