@@ -107,8 +107,16 @@ def _col_has_real_values(series) -> bool:
     return bool(mask.any())
 
 
-def _strip_date_prefix_keep_latest(df: "pd.DataFrame") -> "pd.DataFrame":
+def _strip_date_prefix_keep_latest(df: "pd.DataFrame"):
     """Collapse akshare's "YYYY-MM-DD-单位净值" columns to bare "单位净值".
+
+    Returns ``(frame, observed_date)`` where ``observed_date`` is the date
+    embedded in the column we kept, or None when the frame carries no dated
+    columns. That date is the authoritative trade date for the values —
+    NOT the day the fetch happens to run. Ignoring it is what produced
+    ~23.6k phantom weekend rows every Saturday and Sunday: on a weekend the
+    snapshot still returns Friday's NAV, and stamping it with the run date
+    duplicated Friday into Sat/Sun.
 
     Several akshare endpoints (fund_open_fund_daily_em, fund_etf_fund_daily_em,
     fund_money_fund_daily_em, fund_graded_fund_daily_em) return today's and
@@ -120,7 +128,7 @@ def _strip_date_prefix_keep_latest(df: "pd.DataFrame") -> "pd.DataFrame":
     values, falling back to newest if all are empty.
     """
     if df is None or df.empty:
-        return df
+        return df, None
     # Group all prefixed columns by metric → list[(date, col)] sorted desc by date
     by_metric: dict[str, list[tuple[str, str]]] = {}
     for col in df.columns:
@@ -129,24 +137,27 @@ def _strip_date_prefix_keep_latest(df: "pd.DataFrame") -> "pd.DataFrame":
             continue
         by_metric.setdefault(m.group("metric"), []).append((m.group(1), col))
     if not by_metric:
-        return df
+        return df, None
 
     keep: dict[str, str] = {}  # metric → original col to keep
+    chosen_dates: list[str] = []
     for metric, dated_cols in by_metric.items():
         dated_cols.sort(key=lambda x: x[0], reverse=True)  # newest first
-        chosen = dated_cols[0][1]  # default: newest date
-        for _, col in dated_cols:
+        chosen_date, chosen = dated_cols[0]  # default: newest date
+        for d, col in dated_cols:
             if _col_has_real_values(df[col]):
-                chosen = col
+                chosen_date, chosen = d, col
                 break
         keep[metric] = chosen
+        chosen_dates.append(chosen_date)
 
     rename = {orig: metric for metric, orig in keep.items()}
     drop_cols = [
         c for c in df.columns
         if _DATE_PREFIX_COL_RE.match(str(c)) and c not in rename
     ]
-    return df.drop(columns=drop_cols).rename(columns=rename)
+    observed = max(chosen_dates) if chosen_dates else None
+    return df.drop(columns=drop_cols).rename(columns=rename), observed
 
 
 class IcebergWriter:
@@ -352,14 +363,22 @@ class IcebergWriter:
         # 1a. Collapse akshare's "YYYY-MM-DD-metric" columns to bare "metric"
         # (keeping only the latest date per metric). Affects daily-NAV
         # endpoints that return today + yesterday side by side.
-        pre = _strip_date_prefix_keep_latest(df)
+        pre, observed_date = _strip_date_prefix_keep_latest(df)
 
         # 1b. Rename Chinese columns to canonical names (best-effort)
         renamed = pre.rename(columns=_AKSHARE_TO_CANONICAL)
 
         # 2. Normalize date columns (renames + coerces dtype, drops bad rows)
         from datetime import datetime as _dt, date as _date
+        # Prefer the date the upstream snapshot actually labelled its values
+        # with; fall back to the run date only when the payload carries no
+        # date at all.
         fallback = fetch_date
+        if observed_date:
+            try:
+                fallback = _dt.strptime(observed_date, "%Y-%m-%d").date()
+            except ValueError:
+                pass
         if isinstance(fallback, _dt):
             fallback = fallback.date()
         try:
