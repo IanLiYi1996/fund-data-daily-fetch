@@ -405,6 +405,11 @@ export class FundDataFetchStack extends Stack {
     // fill any funds that were still missing today's fund_daily row
     // (typically money-market funds and back-end share classes that
     // akshare's snapshot endpoints don't cover).
+    //
+    // The Map state outputs an array of per-partition results, and Step
+    // Functions can't apply a resultPath to an array (ReferencePathConflict).
+    // Wrap it in a Pass so we can pass a stable payload to the fallback
+    // Lambda and return its response as the branch output.
     const fundFallbackTask = new tasks.LambdaInvoke(
       this,
       "InvokeFundFallback",
@@ -412,19 +417,18 @@ export class FundDataFetchStack extends Stack {
         lambdaFunction: fundFallbackLambda,
         retryOnServiceExceptions: true,
         payloadResponseOnly: true,
-        resultPath: "$.fund_fallback",
+        payload: sfn.TaskInput.fromObject({}),
         comment: "Fill fund_daily gaps via 天天基金 REST API",
       }
     ).addCatch(
       new sfn.Pass(this, "FundFallbackFailed", {
-        resultPath: "$.fund_fallback",
         result: sfn.Result.fromObject({
           downloader: "fund-fallback",
           success: false,
           error: "Lambda invocation failed",
         }),
       }),
-      { errors: ["States.ALL"], resultPath: "$.fund_fallback" }
+      { errors: ["States.ALL"] }
     );
 
     const fundBranch = new sfn.Pass(this, "FundSeed", {
