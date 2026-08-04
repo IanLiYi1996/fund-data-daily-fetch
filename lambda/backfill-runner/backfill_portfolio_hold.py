@@ -333,9 +333,24 @@ def _export_flat_parquet(warehouse: str) -> None:
     bucket = DEFAULT_BUCKET
     prefix = DEFAULT_S3_PREFIX  # "fund-data-pipeline/"
     key = f"{prefix}fund/_history/fund_portfolio_hold_history.parquet"
-    src_glob = f"s3://{bucket}/{prefix}iceberg/fund_data_lake.db/fund_portfolio_hold/data/**/*.parquet"
 
-    print(f"\nExporting flat parquet → s3://{bucket}/{key}", flush=True)
+    # Read the snapshot's file list, never a directory glob. Overwrite-based
+    # operations (compaction, cleanup) leave superseded data files in place,
+    # so a glob unions current and orphaned rows. That defect shipped stale
+    # NAVs to the consumer via the fund_history export; this table has only
+    # ever been appended to so it is currently unaffected, but relying on
+    # that is fragile.
+    catalog = load_catalog("glue", **{
+        "type": "glue", "glue.region": DEFAULT_REGION, "warehouse": warehouse,
+    })
+    table = catalog.load_table(("fund_data_lake", "fund_portfolio_hold"))
+    live_files = [task.file.file_path for task in table.scan().plan_files()]
+    if not live_files:
+        print("  no live data files; skipping export", flush=True)
+        return
+
+    print(f"\nExporting flat parquet ({len(live_files)} live files) "
+          f"→ s3://{bucket}/{key}", flush=True)
     con = duckdb.connect()
     con.sql(f"CREATE SECRET s3 (TYPE s3, PROVIDER credential_chain, REGION '{DEFAULT_REGION}');")
 
@@ -349,7 +364,7 @@ def _export_flat_parquet(warehouse: str) -> None:
                         PARTITION BY fund_code, report_date, holding_code
                         ORDER BY report_date DESC
                     ) AS rn
-                    FROM read_parquet('{src_glob}')
+                    FROM read_parquet({live_files!r})
                 )
                 SELECT fund_code, report_date, holding_code, holding_name,
                        weight_pct, shares, market_value
