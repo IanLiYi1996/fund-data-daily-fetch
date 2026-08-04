@@ -35,6 +35,7 @@ import boto3
 from pyiceberg.catalog import load_catalog
 from pyiceberg.expressions import GreaterThanOrEqual
 
+from shared.storage.iceberg_writer import IcebergWriter
 from shared.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -69,6 +70,17 @@ MIN_FUNDS = int(os.environ.get("MIN_FUNDS", "20000"))
 MAX_EXPORT_LAG_HOURS = int(os.environ.get("MAX_EXPORT_LAG_HOURS", "30"))
 STATE_MACHINE_ARN = os.environ["STATE_MACHINE_ARN"]
 
+# Coverage is measured against the ACTIVE universe (fund_name minus known-dead
+# funds), because ~680 codes are delisted REITs, liquidated periodic-open
+# products, folded share classes and overseas-denominated QDII shares that
+# will never report again. Judging on a raw count instead hides regressions:
+# at a 20k floor, losing 500 live funds still passes.
+MIN_COVERAGE_PCT = float(os.environ.get("MIN_COVERAGE_PCT", "97.0"))
+# A code silent this long with nothing upstream is treated as inactive.
+INACTIVE_AFTER_DAYS = int(os.environ.get("INACTIVE_AFTER_DAYS", "30"))
+# Cap the per-run age-in probe so the check stays well inside its timeout.
+MAX_AGE_IN_PROBES = int(os.environ.get("MAX_AGE_IN_PROBES", "60"))
+
 
 # See slack-notifier/handler.py — the workflow's only variable is `text`,
 # and HTTP 200 from the trigger does not prove the message was delivered.
@@ -89,10 +101,34 @@ def _post(text: str) -> None:
         logger.info(f"slack post status={resp.status}")
 
 
-def _check_fund_daily(problems: List[str], facts: List[str]) -> None:
-    catalog = load_catalog("glue", **{
+def _catalog():
+    return load_catalog("glue", **{
         "type": "glue", "glue.region": REGION, "warehouse": WAREHOUSE,
     })
+
+
+def _active_universe(catalog) -> tuple[set, set]:
+    """Return (universe, exempt) fund_code sets from the latest snapshots."""
+    fn = catalog.load_table(("fund_data_lake", "fund_name")).scan(
+        selected_fields=("fund_code", "snapshot_date"),
+    ).to_arrow().to_pandas()
+    if fn.empty:
+        return set(), set()
+    latest = fn.snapshot_date.max()
+    universe = set(fn[fn.snapshot_date == latest].fund_code)
+
+    try:
+        inactive = catalog.load_table(("fund_data_lake", "fund_inactive")).scan(
+            selected_fields=("fund_code",),
+        ).to_arrow().to_pandas()
+        exempt = set(inactive.fund_code)
+    except Exception:
+        exempt = set()  # table not created yet
+    return universe, exempt
+
+
+def _check_fund_daily(problems: List[str], facts: List[str]) -> None:
+    catalog = _catalog()
     tbl = catalog.load_table(("fund_data_lake", "fund_daily"))
 
     # Only scan the recent window — a full scan is ~30M rows.
@@ -115,8 +151,9 @@ def _check_fund_daily(problems: List[str], facts: List[str]) -> None:
         c for c, d in zip(arrow["fund_code"].to_pylist(), dates) if d == newest
     })
 
-    facts.append(f"fund_daily 最新 `{newest}`（滞后 {lag} 天）/ {n_funds:,} 只基金")
-
+    facts.append(
+        f"fund_daily 最新 `{newest}`（滞后 {lag} 天）/ {n_funds:,} 只基金"
+    )
     if lag > MAX_LAG_DAYS:
         problems.append(
             f"fund_daily 最新数据是 `{newest}`，滞后 {lag} 天"
@@ -126,6 +163,59 @@ def _check_fund_daily(problems: List[str], facts: List[str]) -> None:
         problems.append(
             f"fund_daily `{newest}` 只有 {n_funds:,} 只基金"
             f"（阈值 {MIN_FUNDS:,}）— 可能是部分写入"
+        )
+
+    _check_coverage(catalog, arrow, problems, facts)
+
+
+# Days whose count is a small fraction of a weekday are non-trading: only
+# money-market funds accrue then, so they must not be scored for coverage.
+_TRADING_DAY_MIN_FUNDS = 5000
+
+
+def _check_coverage(catalog, arrow, problems: List[str], facts: List[str]) -> None:
+    """Coverage on the most recent SETTLED trading day.
+
+    Two adjustments make this meaningful, both learned by measuring:
+
+    - Score a trading day, not the newest row date. Weekends carry only
+      money-market accrual (~800 of 26.7k codes), so scoring them reads as
+      a 3% collapse.
+    - Score the previous settled day, not the newest one. ETFs and money
+      funds disclose T+1, so on the newest day ~2.9k codes legitimately
+      have nothing yet — measured at 89% on the newest day versus
+      98.3-99.9% one day back.
+    """
+    universe, exempt = _active_universe(catalog)
+    if not universe:
+        return
+
+    by_day: Dict[date, set] = {}
+    for code, day in zip(arrow["fund_code"].to_pylist(),
+                         arrow["trade_date"].to_pylist()):
+        by_day.setdefault(day, set()).add(code)
+
+    trading = sorted(d for d, s in by_day.items()
+                     if len(s) >= _TRADING_DAY_MIN_FUNDS)
+    if len(trading) < 2:
+        facts.append("覆盖率: 交易日样本不足，跳过")
+        return
+
+    target = trading[-2]  # newest is still mid-disclosure
+    baseline = set().union(*(by_day[d] for d in trading if d < target)) - exempt
+    if not baseline:
+        return
+
+    covered = by_day[target] & baseline
+    pct = 100.0 * len(covered) / len(baseline)
+    facts.append(
+        f"覆盖率 {pct:.1f}% @ `{target}`（活跃 {len(baseline):,} = "
+        f"universe {len(universe):,} − 豁免 {len(exempt):,} − 未出现）"
+    )
+    if pct < MIN_COVERAGE_PCT:
+        problems.append(
+            f"`{target}` 覆盖率 {pct:.1f}% 低于阈值 {MIN_COVERAGE_PCT}% — "
+            f"{len(baseline) - len(covered):,} 只活跃基金缺数据"
         )
 
 
@@ -201,6 +291,97 @@ def _check_workflow(problems: List[str], facts: List[str]) -> None:
         )
 
 
+def _has_upstream_series(fund_code: str) -> bool:
+    """True if 天天基金 still publishes a NAV history for this code."""
+    try:
+        r = urllib.request.Request(
+            f"https://api.fund.eastmoney.com/f10/lsjz?fundCode={fund_code}"
+            f"&pageIndex=1&pageSize=1",
+            headers={
+                "Referer": "https://fundf10.eastmoney.com/",
+                "User-Agent": "Mozilla/5.0",
+            },
+        )
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            payload = json.loads(resp.read())
+        return bool(payload.get("Data", {}).get("LSJZList"))
+    except Exception:
+        # On a probe error, assume the fund is still alive: wrongly exempting
+        # a live fund hides a real gap, while a missed exemption is only noise.
+        return True
+
+
+def _maintain_exemptions(facts: List[str]) -> None:
+    """Age codes into and out of fund_inactive.
+
+    Hand-maintained lists rot. The estimate that ~900 money-market funds were
+    missing sat in an issue for weeks after the fallback Lambda had already
+    fixed all but 29 of them, and that stale number drove a whole spike down
+    the wrong path. So this is derived from the data on every run.
+
+    Age IN:  absent from fund_daily for INACTIVE_AFTER_DAYS and no upstream
+             series. Probes are capped per run; the backlog drains over
+             successive days.
+    Age OUT: reappeared in fund_daily. Removed immediately — a resumed fund
+             must not stay invisible to the coverage check.
+    """
+    import pandas as pd
+
+    catalog = _catalog()
+    universe, exempt = _active_universe(catalog)
+    if not universe:
+        return
+
+    since = date.today() - timedelta(days=INACTIVE_AFTER_DAYS)
+    recent = catalog.load_table(("fund_data_lake", "fund_daily")).scan(
+        row_filter=GreaterThanOrEqual("trade_date", since),
+        selected_fields=("fund_code",),
+    ).to_arrow()
+    seen = set(recent["fund_code"].to_pylist())
+
+    revived = sorted(exempt & seen)
+    candidates = sorted((universe - seen) - exempt)
+
+    writer = IcebergWriter(
+        database="fund_data_lake", warehouse=WAREHOUSE, subprocess_mode=False,
+    )
+
+    if revived:
+        table = catalog.load_table(("fund_data_lake", "fund_inactive"))
+        keep = table.scan().to_arrow().to_pandas()
+        keep = keep[~keep.fund_code.isin(revived)]
+        arrow = __import__("pyarrow").Table.from_pandas(
+            keep, preserve_index=False,
+        ).cast(table.schema().as_arrow())
+        table.overwrite(arrow)
+        logger.info(f"aged out {len(revived)}: {revived[:10]}")
+
+    added = []
+    for code in candidates[:MAX_AGE_IN_PROBES]:
+        if not _has_upstream_series(code):
+            added.append(code)
+
+    if added:
+        writer.write("fund_inactive", pd.DataFrame({
+            "fund_code": added,
+            "reason": ["no_upstream_series"] * len(added),
+            "last_seen_date": [None] * len(added),
+            "verified_at": [date.today()] * len(added),
+        }), fetch_date=date.today())
+        logger.info(f"aged in {len(added)}")
+
+    parts = []
+    if added:
+        parts.append(f"新增豁免 {len(added)}")
+    if revived:
+        parts.append(f"复活移出 {len(revived)}")
+    pending = max(0, len(candidates) - MAX_AGE_IN_PROBES)
+    if pending:
+        parts.append(f"待探测 {pending}")
+    if parts:
+        facts.append("豁免名单维护: " + " / ".join(parts))
+
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     problems: List[str] = []
     facts: List[str] = []
@@ -210,6 +391,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             check(problems, facts)
         except Exception as e:
             problems.append(f"{check.__name__} 自身报错: {type(e).__name__}: {e}")
+
+    # List upkeep is best-effort: a failure here must not mask the checks
+    # above, so it only logs.
+    try:
+        _maintain_exemptions(facts)
+    except Exception as e:
+        logger.warning(f"exemption upkeep failed: {type(e).__name__}: {e}")
 
     # Post every run, pass or fail. Staying silent on success looked tidy
     # but made "everything is fine" and "the monitor itself is dead"
