@@ -13,13 +13,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY export-fund-history/handler.py .
 
-# Pre-install the httpfs extension into an in-image cache so the Lambda
-# doesn't need to download it at cold start (~10 MB, ~2 s saved per call).
+# Pre-install DuckDB extensions into an in-image cache: Lambda has no
+# egress for extension downloads, so anything missing here fails at runtime.
+# avro is needed to walk the Iceberg manifest list when resolving the live
+# data-file set.
 ENV DUCKDB_EXT_DIR=/opt/duckdb_ext
 RUN mkdir -p ${DUCKDB_EXT_DIR} && \
     python -c "import duckdb, os; c=duckdb.connect(); \
     c.sql(f\"SET extension_directory='{os.environ['DUCKDB_EXT_DIR']}'\"); \
-    c.sql('INSTALL httpfs'); c.sql('INSTALL aws')"
+    c.sql('INSTALL httpfs'); c.sql('INSTALL aws'); c.sql('INSTALL avro')"
 
 ENTRYPOINT ["python", "-m", "awslambdaric"]
 CMD ["handler.lambda_handler"]
