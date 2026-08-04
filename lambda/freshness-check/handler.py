@@ -67,6 +67,7 @@ def _webhook_url() -> str:
 MAX_LAG_DAYS = int(os.environ.get("MAX_LAG_DAYS", "4"))
 MIN_FUNDS = int(os.environ.get("MIN_FUNDS", "20000"))
 MAX_EXPORT_LAG_HOURS = int(os.environ.get("MAX_EXPORT_LAG_HOURS", "30"))
+STATE_MACHINE_ARN = os.environ["STATE_MACHINE_ARN"]
 
 
 # See slack-notifier/handler.py — the workflow's only variable is `text`,
@@ -162,16 +163,60 @@ def _check_export(problems: List[str], facts: List[str]) -> None:
         )
 
 
+def _check_workflow(problems: List[str], facts: List[str]) -> None:
+    """Report on today's collection run so the heartbeat says how it went.
+
+    Freshness alone doesn't answer "did tonight's run work" — a partial
+    failure can leave yesterday's data looking fine. Surface the actual
+    execution status and duration.
+    """
+    sfn = boto3.client("stepfunctions", region_name=REGION)
+    execs = sfn.list_executions(
+        stateMachineArn=STATE_MACHINE_ARN, maxResults=1
+    )["executions"]
+    if not execs:
+        problems.append("找不到任何 FundDataCollectionWorkflow 执行记录")
+        return
+
+    e = execs[0]
+    status = e["status"]
+    started = e["startDate"]
+    mins = (
+        (e["stopDate"] - started).total_seconds() / 60
+        if e.get("stopDate") else None
+    )
+    dur = f"{mins:.0f} 分钟" if mins is not None else "进行中"
+    facts.append(
+        f"采集工作流 `{status}` / {started.strftime('%m-%d %H:%M')} UTC 启动 / {dur}"
+    )
+    if status not in ("SUCCEEDED", "RUNNING"):
+        problems.append(f"最近一次采集工作流状态是 `{status}`")
+
+    # A run that started well before today's window means the schedule
+    # stopped firing — the workflow isn't failing, it just isn't running.
+    age_h = (datetime.now(timezone.utc) - started).total_seconds() / 3600
+    if age_h > 30:
+        problems.append(
+            f"最近一次采集是 {age_h:.0f} 小时前 — 定时触发可能已停止"
+        )
+
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     problems: List[str] = []
     facts: List[str] = []
 
-    for check in (_check_fund_daily, _check_export):
+    for check in (_check_workflow, _check_fund_daily, _check_export):
         try:
             check(problems, facts)
         except Exception as e:
             problems.append(f"{check.__name__} 自身报错: {type(e).__name__}: {e}")
 
+    # Post every run, pass or fail. Staying silent on success looked tidy
+    # but made "everything is fine" and "the monitor itself is dead"
+    # indistinguishable from the outside — on 2026-08-03 this check ran
+    # clean and sent nothing, which read as an outage. A daily heartbeat
+    # turns absence of a message into a signal instead of an ambiguity.
+    # Set quiet_when_healthy to suppress the green ping for ad-hoc runs.
     if problems:
         body = "\n".join(
             [f"🔴 *fund-data 数据新鲜度检查未通过* ({len(problems)} 项)"]
@@ -181,11 +226,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         )
         _post(body)
         logger.error(f"{len(problems)} problems: {problems}")
-    elif event.get("always_notify"):
+    elif not event.get("quiet_when_healthy"):
         body = "\n".join(
-            ["✅ *fund-data 数据新鲜度检查通过*"] + [f"• {f}" for f in facts]
+            ["✅ *fund-data 每日检查通过*"] + [f"• {f}" for f in facts]
         )
         _post(body)
+        logger.info("healthy; heartbeat sent")
 
     return {
         "statusCode": 200,

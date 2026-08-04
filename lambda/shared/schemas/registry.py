@@ -380,3 +380,33 @@ def _kline(name: str, source_category: str) -> TableSpec:
 TABLES["kline_a"] = _kline("kline_a", "kline_a")
 TABLES["kline_hk"] = _kline("kline_hk", "kline_hk")
 TABLES["kline_us"] = _kline("kline_us", "kline_us")
+
+
+# Known-inactive funds: delisted REITs, liquidated periodic-open products,
+# folded share classes, and overseas-denominated QDII shares that mainland
+# pages never publish. These are NOT collection gaps — the products stopped
+# reporting — so coverage must be measured against (universe - inactive)
+# rather than the raw fund_name snapshot. See docs/spikes/issue-1-*.
+#
+# Maintained automatically by freshness-check: a code absent from fund_daily
+# for INACTIVE_AFTER_DAYS with no upstream series ages in; any code that
+# reappears ages out. Hand-maintained lists rot — the original "~900 missing
+# money-market funds" estimate was stale by ~870 before anyone noticed.
+TABLES["fund_inactive"] = TableSpec(
+    name="fund_inactive",
+    schema=Schema(
+        NestedField(1, "fund_code", StringType(), required=True),
+        NestedField(2, "reason", StringType()),
+        NestedField(3, "last_seen_date", DateType()),
+        NestedField(4, "verified_at", DateType(), required=True),
+        identifier_field_ids=[1],
+    ),
+    partition_spec=PartitionSpec(
+        PartitionField(source_id=4, field_id=1000, transform=YearTransform(),
+                       name="verified_year")
+    ),
+    identifier_fields=["fund_code"],
+    write_mode="upsert",
+    source_category="fund",
+    date_specs=[DateColumnSpec(["verified_at"], "verified_at", "date")],
+)

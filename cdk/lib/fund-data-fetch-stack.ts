@@ -337,6 +337,10 @@ export class FundDataFetchStack extends Stack {
       histKlineFetchLambda,
       catalogLambda,
       fundFallbackLambda,
+      // Reads the Iceberg snapshot to get the live data-file list rather
+      // than globbing the directory, which would union orphaned files left
+      // behind by compaction/overwrite.
+      exportFundHistoryLambda,
     ].forEach((fn) => fn.addToRolePolicy(icebergGluePolicy));
 
     // ========== Iceberg Maintenance Lambda ==========
@@ -957,7 +961,11 @@ export class FundDataFetchStack extends Stack {
       "Assert fund_daily freshness + export replication, alert to Slack",
       1024,
       5,
-      { ...lambdaEnv, SLACK_WEBHOOK_SECRET_ARN: slackWebhookSecret.secretArn }
+      {
+        ...lambdaEnv,
+        SLACK_WEBHOOK_SECRET_ARN: slackWebhookSecret.secretArn,
+        STATE_MACHINE_ARN: this.stateMachine.stateMachineArn,
+      }
     );
 
     // 19:00 UTC — two hours after the 17:00 daily workflow starts, so a
@@ -980,6 +988,18 @@ export class FundDataFetchStack extends Stack {
     freshnessCheckLambda.addToRolePolicy(icebergGluePolicy);
     freshnessCheckLambda.node.addDependency(glueDatabase);
     slackWebhookSecret.grantRead(freshnessCheckLambda);
+
+    // The heartbeat reports on the latest collection run, so it needs to
+    // read execution history (not start anything).
+    freshnessCheckLambda.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["states:ListExecutions", "states:DescribeExecution"],
+        resources: [
+          this.stateMachine.stateMachineArn,
+          `arn:aws:states:${this.region}:${this.account}:execution:${this.stateMachine.stateMachineName}:*`,
+        ],
+      })
+    );
 
     // ========== CloudWatch Alarms ==========
 
