@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import pandas as pd
 import requests
@@ -88,7 +88,19 @@ def _fetch_one(code_name, start_date: str, end_date: str):
 def _get_missing_universe(
     catalog, end_date: date, start_date: date,
 ) -> pd.DataFrame:
-    """Return fund_code + fund_name for funds not in fund_daily for [start, end]."""
+    """Funds with no fund_daily row ON end_date.
+
+    The gap is computed for the target day alone, while the FETCH window
+    stays [start_date, end_date] — those are deliberately different spans.
+
+    Widening the lookback to 14 days (so hold-period products' disclosure
+    dates fall inside the fetch range) originally also widened this
+    membership test, which broke it: a money-market or ETF code that got
+    filled on any day in the window counted as "covered" and was never
+    fetched again. ~2,500 funds silently dropped out of daily coverage
+    from 2026-08-03 — Iceberg went from 26.3k to 23.8k codes per day
+    while the fetch window still looked healthy.
+    """
     name_tbl = catalog.load_table((DATABASE, "fund_name"))
     fn = name_tbl.scan().to_arrow().to_pandas()
     latest = fn.snapshot_date.max()
@@ -99,7 +111,7 @@ def _get_missing_universe(
     daily_tbl = catalog.load_table((DATABASE, "fund_daily"))
     covered_arrow = daily_tbl.scan(
         row_filter=And(
-            GreaterThanOrEqual("trade_date", start_date),
+            GreaterThanOrEqual("trade_date", end_date),
             LessThanOrEqual("trade_date", end_date),
         ),
         selected_fields=("fund_code",),
@@ -109,13 +121,36 @@ def _get_missing_universe(
     return fn_latest[~fn_latest.fund_code.isin(covered)][["fund_code", "fund_name"]]
 
 
+def _latest_loaded_date(catalog) -> Optional[date]:
+    """Newest trade_date present in fund_daily.
+
+    Not date.today(): Lambda runs in UTC, the collection cron fires at
+    17:00 UTC, so between 00:00 and 17:00 UTC "today" has no rows at all.
+    Using it as the target day makes the entire universe look missing and
+    the fallback tries to fetch all ~27k codes.
+    """
+    tbl = catalog.load_table((DATABASE, "fund_daily"))
+    since = date.today() - timedelta(days=10)
+    arrow = tbl.scan(
+        row_filter=GreaterThanOrEqual("trade_date", since),
+        selected_fields=("trade_date",),
+    ).to_arrow()
+    days = arrow["trade_date"].to_pylist()
+    return max(days) if days else None
+
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     started = datetime.utcnow()
 
+    catalog = load_catalog("glue", **{
+        "type": "glue", "glue.region": REGION, "warehouse": WAREHOUSE,
+    })
+
     end_date_str = event.get("trade_date")
-    end_date = (
-        date.fromisoformat(end_date_str) if end_date_str else date.today()
-    )
+    if end_date_str:
+        end_date = date.fromisoformat(end_date_str)
+    else:
+        end_date = _latest_loaded_date(catalog) or date.today()
     # 3 days was too tight. Periodic-open funds (3/6-month-hold FOF, some
     # 定开债) disclose on their own cadence, so a fund whose latest NAV is
     # 10 days old still counts as "missing" every single day while the
@@ -128,12 +163,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     start_date = end_date - timedelta(days=lookback)
 
     logger.info(
-        f"Fallback fetch: window {start_date.isoformat()} → {end_date.isoformat()}"
+        f"Fallback fetch: target {end_date.isoformat()} / "
+        f"fetch window {start_date.isoformat()} → {end_date.isoformat()}"
     )
 
-    catalog = load_catalog("glue", **{
-        "type": "glue", "glue.region": REGION, "warehouse": WAREHOUSE,
-    })
     missing = _get_missing_universe(catalog, end_date, start_date)
     logger.info(f"Missing funds in window: {len(missing):,}")
 
