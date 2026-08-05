@@ -10,18 +10,25 @@ This Lambda asserts the consumer-visible contract directly, then posts
 to Slack. It runs on its own schedule after the daily workflow window,
 so it fires whether or not the workflow reported success.
 
-Checks (each independent; all failures collected into one message):
+Checks (each independent; all failures collected into ONE message — the
+channel gets one post a day, so silence means the monitor itself stopped):
 
-1. **fund_daily freshness** — the newest ``trade_date`` in the Iceberg
-   table is within ``MAX_LAG_DAYS`` of today (weekends/holidays make a
-   strict "== today" check too noisy).
-2. **fund_daily coverage** — that newest day has at least
-   ``MIN_FUNDS`` distinct fund_codes, so a partial write is caught.
-3. **export freshness** — the current month's
-   ``fund_history/trade_month=YYYY-MM/part-0.parquet`` was modified
-   within ``MAX_EXPORT_LAG_HOURS``.
-4. **replication** — that object's ``ReplicationStatus`` is COMPLETED,
-   i.e. it actually reached the consumer bucket.
+1. **workflow status** — the latest collection execution SUCCEEDED, and
+   started within 30h. A schedule that stops firing produces no failure
+   at all, so staleness has to be checked separately from status.
+2. **fund_daily freshness** — newest ``trade_date`` within
+   ``MAX_LAG_DAYS`` (weekends/holidays make "== today" too noisy).
+3. **coverage** — share of the ACTIVE universe (fund_name minus known-dead
+   funds) present on the last settled trading day. An absolute floor is
+   blind to real regressions: at 26.7k active codes and a 20k floor,
+   losing 2,000 live funds still passes.
+4. **export + replication** — the current month's parquet was written
+   within ``MAX_EXPORT_LAG_HOURS`` and its ``ReplicationStatus`` is
+   COMPLETED, i.e. it reached the consumer bucket.
+5. **upstream agreement** — sampled diff of stored NAVs and date sets
+   against 天天基金. Checks 1-4 only inspect our own output, so a
+   transform bug is invisible to them; the weekend date-offset defect
+   shipped for two months with all of them green.
 """
 from __future__ import annotations
 
@@ -382,11 +389,49 @@ def _maintain_exemptions(facts: List[str]) -> None:
         facts.append("豁免名单维护: " + " / ".join(parts))
 
 
+def _check_upstream(problems: List[str], facts: List[str]) -> None:
+    """Sampled value+date diff against upstream — the only check that asks
+    whether the data is RIGHT rather than merely present.
+
+    Folded into the heartbeat rather than run as its own Lambda so the
+    channel gets one message a day. Sampling is capped and rotates by date,
+    so coverage accumulates across runs instead of re-checking the same
+    names.
+    """
+    from shared.quality.reconcile import reconcile
+
+    r = reconcile(_catalog())
+    if not r.get("checked"):
+        facts.append("上游对账: 样本为空，跳过")
+        return
+
+    facts.append(
+        f"上游对账 {r['passed']}/{r['checked']} 只一致"
+        + (f"（探测失败 {r['probe_errors']}）" if r["probe_errors"] else "")
+    )
+    if r["extra_dates"]:
+        problems.append(
+            f"我们多出 {len(r['extra_dates'])} 个日期（上游无）: "
+            + ", ".join(r["extra_dates"][:5])
+        )
+    if r["missing_dates"]:
+        problems.append(
+            f"我们缺少 {len(r['missing_dates'])} 个日期（上游有）: "
+            + ", ".join(r["missing_dates"][:5])
+        )
+    if r["value_diffs"]:
+        problems.append(
+            f"净值与上游不符 {len(r['value_diffs'])} 处: "
+            + "; ".join(r["value_diffs"][:5])
+        )
+
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     problems: List[str] = []
     facts: List[str] = []
 
-    for check in (_check_workflow, _check_fund_daily, _check_export):
+    for check in (_check_workflow, _check_fund_daily, _check_export,
+                  _check_upstream):
         try:
             check(problems, facts)
         except Exception as e:

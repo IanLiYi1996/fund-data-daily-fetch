@@ -64,3 +64,60 @@ def test_t_plus_one_day_would_false_alarm():
     newest_day = 23_781
     assert _passes_floor(newest_day)
     assert not _passes_ratio(newest_day)
+
+
+# --- per-row date/value selection (iceberg_writer) -------------------------
+#
+# akshare returns today and yesterday as parallel columns, and which one is
+# populated varies BY ROW. Choosing one column for the whole frame discarded
+# 684 T+1 products' NAVs every day; they reached the consumer as NULL while
+# upstream had the value. These cases pin the per-row behaviour, including
+# the weekend shape an earlier fix addressed.
+
+def _strip():
+    import sys
+    sys.path.insert(0, "lambda")
+    from shared.storage.iceberg_writer import _strip_date_prefix_keep_latest
+    return _strip_date_prefix_keep_latest
+
+
+def test_uniform_date_returns_scalar():
+    import pandas as pd
+    f, observed = _strip()(pd.DataFrame([
+        {"基金代码": "a", "2026-08-04-单位净值": "1.0", "2026-08-03-单位净值": "0.9"},
+        {"基金代码": "b", "2026-08-04-单位净值": "2.0", "2026-08-03-单位净值": "1.9"},
+    ]))
+    assert observed == "2026-08-04"
+    assert list(f["单位净值"]) == ["1.0", "2.0"]
+    assert "__observed_date__" not in f.columns
+
+
+def test_mixed_dates_keep_each_rows_own_value():
+    """The regression that shipped: row b's only value is under the older date."""
+    import pandas as pd
+    f, observed = _strip()(pd.DataFrame([
+        {"基金代码": "a", "2026-08-04-单位净值": "1.0", "2026-08-03-单位净值": "0.9"},
+        {"基金代码": "b", "2026-08-04-单位净值": "",    "2026-08-03-单位净值": "1.9"},
+    ]))
+    assert observed is None, "mixed dates must not collapse to one scalar"
+    assert list(f["单位净值"]) == ["1.0", "1.9"], "row b's NAV must survive"
+    assert list(f["__observed_date__"]) == ["2026-08-04", "2026-08-03"]
+
+
+def test_weekend_shape_still_picks_friday():
+    """Earlier fix: on a weekend the newest column is all placeholders."""
+    import pandas as pd
+    f, observed = _strip()(pd.DataFrame([
+        {"基金代码": "a", "2026-08-01-单位净值": "---", "2026-07-31-单位净值": "4.2338"},
+    ]))
+    assert observed == "2026-07-31"
+    assert list(f["单位净值"]) == ["4.2338"]
+
+
+def test_all_empty_keeps_newest_date_and_null_value():
+    import pandas as pd
+    f, observed = _strip()(pd.DataFrame([
+        {"基金代码": "a", "2026-08-04-单位净值": "", "2026-08-03-单位净值": ""},
+    ]))
+    assert observed == "2026-08-04"
+    assert list(f["单位净值"]) == [""]

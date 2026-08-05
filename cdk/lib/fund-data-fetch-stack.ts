@@ -958,9 +958,9 @@ export class FundDataFetchStack extends Stack {
       "FreshnessCheckLambda",
       lambdaDir,
       "freshness-check/Dockerfile",
-      "Assert fund_daily freshness + export replication, alert to Slack",
+      "Assert freshness, coverage, replication and upstream agreement",
       1024,
-      5,
+      10,
       {
         ...lambdaEnv,
         SLACK_WEBHOOK_SECRET_ARN: slackWebhookSecret.secretArn,
@@ -980,6 +980,7 @@ export class FundDataFetchStack extends Stack {
     freshnessRule.addTarget(
       new targets.LambdaFunction(freshnessCheckLambda)
     );
+
 
     // freshness-check reads fund_daily via the Glue catalog and heads the
     // export object, so it needs the same S3 + Glue grants as the fetchers.

@@ -110,26 +110,23 @@ def _col_has_real_values(series) -> bool:
 def _strip_date_prefix_keep_latest(df: "pd.DataFrame"):
     """Collapse akshare's "YYYY-MM-DD-单位净值" columns to bare "单位净值".
 
-    Returns ``(frame, observed_date)`` where ``observed_date`` is the date
-    embedded in the column we kept, or None when the frame carries no dated
-    columns. That date is the authoritative trade date for the values —
-    NOT the day the fetch happens to run. Ignoring it is what produced
-    ~23.6k phantom weekend rows every Saturday and Sunday: on a weekend the
-    snapshot still returns Friday's NAV, and stamping it with the run date
-    duplicated Friday into Sat/Sun.
+    Returns ``(frame, observed_date)``. When rows disagree about which date
+    they carry, ``observed_date`` is None and the frame gains a
+    ``__observed_date__`` column holding the per-row date; callers use that
+    in preference to the run date.
 
-    Several akshare endpoints (fund_open_fund_daily_em, fund_etf_fund_daily_em,
-    fund_money_fund_daily_em, fund_graded_fund_daily_em) return today's and
-    yesterday's snapshots as PARALLEL columns:
-        基金代码 | 基金简称 | 2026-05-11-单位净值 | 2026-05-08-单位净值
-    The LATEST date often holds placeholders ('---', empty) until market
-    close; earlier dates are populated. So for each metric we pick the
-    column with the most-recent date that ALSO has real (non-placeholder)
-    values, falling back to newest if all are empty.
+    Per-row selection matters. These endpoints return today and yesterday as
+    parallel columns, and which one is populated varies BY ROW: on 2026-08-04
+    most funds had a value under 08-04, but 684 T+1 products (QDII, FOF)
+    only had one under 08-03. Choosing a single column for the whole frame
+    discarded those 684 NAVs every single day — they reached the consumer as
+    NULL while upstream had the value. Found by the upstream reconciliation
+    check, not by any of the checks that only inspect our own output.
     """
     if df is None or df.empty:
         return df, None
-    # Group all prefixed columns by metric → list[(date, col)] sorted desc by date
+
+    # metric -> [(date, col)] newest first
     by_metric: dict[str, list[tuple[str, str]]] = {}
     for col in df.columns:
         m = _DATE_PREFIX_COL_RE.match(str(col))
@@ -138,26 +135,36 @@ def _strip_date_prefix_keep_latest(df: "pd.DataFrame"):
         by_metric.setdefault(m.group("metric"), []).append((m.group(1), col))
     if not by_metric:
         return df, None
+    for cols in by_metric.values():
+        cols.sort(key=lambda x: x[0], reverse=True)
 
-    keep: dict[str, str] = {}  # metric → original col to keep
-    chosen_dates: list[str] = []
-    for metric, dated_cols in by_metric.items():
-        dated_cols.sort(key=lambda x: x[0], reverse=True)  # newest first
-        chosen_date, chosen = dated_cols[0]  # default: newest date
-        for d, col in dated_cols:
-            if _col_has_real_values(df[col]):
-                chosen_date, chosen = d, col
-                break
-        keep[metric] = chosen
-        chosen_dates.append(chosen_date)
+    out = df.drop(columns=[c for cols in by_metric.values() for _, c in cols])
 
-    rename = {orig: metric for metric, orig in keep.items()}
-    drop_cols = [
-        c for c in df.columns
-        if _DATE_PREFIX_COL_RE.match(str(c)) and c not in rename
-    ]
-    observed = max(chosen_dates) if chosen_dates else None
-    return df.drop(columns=drop_cols).rename(columns=rename), observed
+    # The date is driven by the primary metric so every metric on a row comes
+    # from the same day; picking per-metric could mix dates within one row.
+    primary = "单位净值" if "单位净值" in by_metric else next(iter(by_metric))
+
+    def _row_date(row) -> Optional[str]:
+        for d, col in by_metric[primary]:
+            if str(row[col]) not in _PLACEHOLDER_VALUES:
+                return d
+        return by_metric[primary][0][0]  # all empty: newest, value stays null
+
+    row_dates = df.apply(_row_date, axis=1)
+
+    for metric, cols in by_metric.items():
+        col_by_date = {d: c for d, c in cols}
+        fallback = cols[0][1]
+        out[metric] = [
+            df.iloc[i][col_by_date.get(d, fallback)]
+            for i, d in enumerate(row_dates)
+        ]
+
+    uniq = set(row_dates)
+    if len(uniq) == 1:
+        return out, uniq.pop()
+    out["__observed_date__"] = row_dates.values
+    return out, None
 
 
 class IcebergWriter:
@@ -367,6 +374,16 @@ class IcebergWriter:
 
         # 1b. Rename Chinese columns to canonical names (best-effort)
         renamed = pre.rename(columns=_AKSHARE_TO_CANONICAL)
+
+        # When rows carry different dates, promote the per-row date into the
+        # spec's own date column so normalize() keeps each row on its own
+        # day. A single fallback would collapse them all onto one date.
+        per_row_dates = None
+        if "__observed_date__" in renamed.columns:
+            per_row_dates = renamed.pop("__observed_date__")
+            date_col = spec.date_specs[0].target if spec.date_specs else None
+            if date_col and date_col not in renamed.columns:
+                renamed[date_col] = per_row_dates
 
         # 2. Normalize date columns (renames + coerces dtype, drops bad rows)
         from datetime import datetime as _dt, date as _date
