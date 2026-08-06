@@ -44,6 +44,14 @@ _HEADERS = {
     "User-Agent": "Mozilla/5.0",
 }
 
+# The daily gap is ~5,700 codes at ~1.8s each. At 8 workers that is ~21
+# minutes, which overruns Lambda's 15-minute ceiling — the 2026-08-05 run
+# timed out and left the day short. 24 workers brings it to ~7 minutes with
+# headroom. Upstream tolerated 8 comfortably; if it starts rate-limiting,
+# lower this rather than accepting silent truncation, because a timeout
+# leaves the day partially filled with no error surfaced anywhere.
+FALLBACK_WORKERS = int(os.environ.get("FALLBACK_WORKERS", "24"))
+
 
 def _fetch_one(code_name, start_date: str, end_date: str):
     code, name = code_name
@@ -194,7 +202,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     frames: list[pd.DataFrame] = []
     empty = err = 0
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=FALLBACK_WORKERS) as ex:
         futs = {
             ex.submit(
                 _fetch_one, it, start_date.isoformat(), end_date.isoformat()
