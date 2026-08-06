@@ -46,22 +46,27 @@ _HEADERS = {
 # Sample across fund types, not just the big open-end names. Both shipped
 # bugs hit money-market and ETF rows hardest, and a naive random sample is
 # ~85% plain open-end funds — it would likely have missed them.
-_STRATA = {
-    "money_market": ("货币", "现金", "增利", "余额宝", "日日", "薪金", "保证金"),
-    "graded_lof": ("分级", "LOF"),
-    "index_etf": ("ETF", "指数"),
+#
+# Keyed on fund_name.fund_type, NOT name keywords. Matching names misfires:
+# "现金" hits 华夏国证自由现金流ETF (an equity ETF) and "增利" hits
+# 华泰柏瑞稳本增利债券 (a bond fund), which mislabelled 252 funds as
+# money-market and made a weekend cleanup skip them.
+_STRATA_PREFIXES = {
+    "money_market": ("货币型",),
+    "index_etf": ("指数型",),
     "fof": ("FOF",),
     "qdii": ("QDII",),
-    "bond": ("债", "定开", "持有期"),
+    "bond": ("债券型",),
+    "equity": ("股票型", "混合型"),
 }
 
 
-def _stratum(name: str) -> str:
-    n = name or ""
-    for label, needles in _STRATA.items():
-        if any(x in n for x in needles):
+def _stratum(fund_type: str) -> str:
+    t = fund_type or ""
+    for label, prefixes in _STRATA_PREFIXES.items():
+        if any(t.startswith(x) for x in prefixes):
             return label
-    return "open_end"
+    return "other"
 
 
 def _upstream(code: str, lo: date, hi: date) -> Optional[Dict[date, float]]:
@@ -95,15 +100,15 @@ def _upstream(code: str, lo: date, hi: date) -> Optional[Dict[date, float]]:
 def _build_sample(catalog, rng: random.Random) -> List[tuple]:
     """Stratified sample of (code, name, stratum), rotated by RNG seed."""
     fn = catalog.load_table((DATABASE, "fund_name")).scan(
-        selected_fields=("fund_code", "fund_name", "snapshot_date"),
+        selected_fields=("fund_code", "fund_name", "fund_type", "snapshot_date"),
     ).to_arrow().to_pandas()
     if fn.empty:
         return []
     fn = fn[fn.snapshot_date == fn.snapshot_date.max()].drop_duplicates("fund_code")
 
     buckets: Dict[str, list] = {}
-    for code, name in zip(fn.fund_code, fn.fund_name):
-        buckets.setdefault(_stratum(name), []).append((code, name))
+    for code, name, ftype in zip(fn.fund_code, fn.fund_name, fn.fund_type):
+        buckets.setdefault(_stratum(ftype), []).append((code, name))
 
     # Even split across strata so small-but-risky types are always represented.
     per = max(1, SAMPLE_SIZE // max(1, len(buckets)))

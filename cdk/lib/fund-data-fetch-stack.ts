@@ -965,6 +965,12 @@ export class FundDataFetchStack extends Stack {
         ...lambdaEnv,
         SLACK_WEBHOOK_SECRET_ARN: slackWebhookSecret.secretArn,
         STATE_MACHINE_ARN: this.stateMachine.stateMachineArn,
+        // Reconciliation is the only check that compares against the source,
+        // so sample width is what bounds how fast it finds things. 200/day
+        // costs ~2 min of runtime; chosen over writing plausibility rules
+        // (see the closed issue #4) because it needs no guess about what
+        // counts as implausible.
+        RECONCILE_SAMPLE_SIZE: "200",
       }
     );
 

@@ -108,15 +108,24 @@ def _get_missing_universe(
         fn[fn.snapshot_date == latest].drop_duplicates("fund_code").reset_index(drop=True)
     )
 
+    # "Covered" means a usable NAV, not merely a row. The main snapshot
+    # endpoint returns rows for funds it has no value for (both date columns
+    # blank), and treating those as covered made the fallback skip them —
+    # e.g. 010866 sat at NULL for a week while lsjz had 1.0107..1.0090 the
+    # whole time.
     daily_tbl = catalog.load_table((DATABASE, "fund_daily"))
     covered_arrow = daily_tbl.scan(
         row_filter=And(
             GreaterThanOrEqual("trade_date", end_date),
             LessThanOrEqual("trade_date", end_date),
         ),
-        selected_fields=("fund_code",),
+        selected_fields=("fund_code", "unit_nav"),
     ).to_arrow()
-    covered = set(covered_arrow["fund_code"].to_pylist())
+    covered = {
+        c for c, v in zip(covered_arrow["fund_code"].to_pylist(),
+                          covered_arrow["unit_nav"].to_pylist())
+        if v is not None
+    }
 
     return fn_latest[~fn_latest.fund_code.isin(covered)][["fund_code", "fund_name"]]
 
