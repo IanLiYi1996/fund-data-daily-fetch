@@ -113,12 +113,68 @@ def _put_parquet(s3, bucket: str, key: str, df: pd.DataFrame) -> dict[str, Any]:
     return {"bucket": bucket, "key": key, "size": len(body), "rows": len(df)}
 
 
+def _carry_forward(
+    s3, bucket: str, canonical_key: str, fresh: pd.DataFrame,
+) -> tuple[pd.DataFrame, int]:
+    """Union this run's rows with the previous canonical file, per fund_code.
+
+    The merge used to publish `pd.concat(this week's parts)` directly, which
+    made the canonical file a snapshot of whatever the run happened to
+    collect rather than the accumulated best-known state. Upstream
+    (fundf10.eastmoney.com) rate-limits us hard — the 2026-08-09 run logged
+    error_count=1008 of ~27.5k codes as `HTTPError: 514 Frequency Capped`
+    — and those funds were silently dropped from the published file. That is
+    how 110022 易方达消费行业股票 lost a manager tenure it had carried for
+    weeks: nothing deleted it, the overwrite just didn't include it.
+
+    Because each run re-fetches a fund's FULL history, a fund present in
+    this run is authoritative for that fund and its old rows are replaced
+    wholesale. A fund absent from this run keeps its previous rows. So the
+    granularity of the union has to be the fund, not the row — a row-level
+    concat+dedup would resurrect tenures that upstream has since corrected.
+    """
+    if fresh.empty:
+        return fresh, 0
+
+    code_col = "基金代码"
+    if code_col not in fresh.columns:
+        return fresh, 0
+
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=canonical_key)
+        prior = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+    except Exception as exc:
+        err_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+        if err_code not in {"NoSuchKey", "404", "NotFound"}:
+            # A read failure must not silently degrade into an overwrite that
+            # drops history — that is the exact defect this guards against.
+            raise
+        logger.info(f"no prior {canonical_key}; publishing this run as-is")
+        return fresh, 0
+
+    if prior.empty or code_col not in prior.columns:
+        return fresh, 0
+
+    refreshed = set(fresh[code_col].astype(str))
+    keep = prior[~prior[code_col].astype(str).isin(refreshed)]
+    if keep.empty:
+        return fresh, 0
+
+    carried = int(keep[code_col].nunique())
+    logger.info(
+        f"carrying forward {carried:,} funds / {len(keep):,} rows not "
+        f"refreshed this run (fetched {len(refreshed):,})"
+    )
+    return pd.concat([fresh, keep], ignore_index=True), carried
+
+
 def run(
     event: dict,
     fetcher: FundHistoryFetcher,
     s3_client: S3Client,
     list_provider: Optional[Callable[[], list[str]]] = None,
     boto3_s3: Optional[Any] = None,
+    remaining: Optional[Callable[[], float]] = None,
 ) -> dict[str, Any]:
     """Pure-function entrypoint that takes its dependencies — used by tests."""
     mode = event.get("mode")
@@ -146,10 +202,11 @@ def run(
         f"chunk_size={len(chunk)} snapshot_date={snapshot_date}"
     )
 
-    if mode == "manager_full":
-        df, errors = fetcher.fetch_manager_history(chunk, snapshot_date=snapshot_date)
-    else:
-        df, errors = fetcher.fetch_scale_history(chunk, snapshot_date=snapshot_date)
+    fetch = (
+        fetcher.fetch_manager_history if mode == "manager_full"
+        else fetcher.fetch_scale_history
+    )
+    df, errors = fetch(chunk, snapshot_date=snapshot_date, remaining=remaining)
 
     upload_info: dict[str, Any] = {}
     if not df.empty:
@@ -213,6 +270,7 @@ def _run_merge(
 
     merged_df = pd.concat(frames, ignore_index=True)
     canonical_key = _canonical_key(s3_client, base_name)
+    merged_df, carried = _carry_forward(s3, bucket, canonical_key, merged_df)
     upload_info = _put_parquet(s3, bucket, canonical_key, merged_df)
 
     # Delete staging part files after successful merge upload
@@ -228,6 +286,7 @@ def _run_merge(
         "parts_merged": len(merged_keys),
         "parts_missing": missing,
         "row_count": len(merged_df),
+        "funds_carried_forward": carried,
         "s3": upload_info,
     }
 
@@ -237,9 +296,15 @@ def lambda_handler(event: dict, context: Any) -> dict[str, Any]:
     config = Config.from_env()
     config.validate()
     s3_client = S3Client(config.s3_bucket, key_prefix=getattr(config, "s3_prefix", "") or "")
-    fetcher = FundHistoryFetcher(max_workers=8, max_retries=3)
+    fetcher = FundHistoryFetcher(max_workers=8, max_retries=5)
+    # Let the retry logic spend the invocation's real remaining time instead of
+    # a fixed guess: rate-limit backoff is only worth taking if the partition
+    # can still finish afterwards.
+    remaining = None
+    if context is not None and hasattr(context, "get_remaining_time_in_millis"):
+        remaining = lambda: context.get_remaining_time_in_millis() / 1000.0
     try:
-        return run(event, fetcher=fetcher, s3_client=s3_client)
+        return run(event, fetcher=fetcher, s3_client=s3_client, remaining=remaining)
     except Exception as exc:
         logger.exception("fund-history-fetcher failed")
         return {

@@ -25,8 +25,13 @@ channel gets one post a day, so silence means the monitor itself stopped):
 4. **export + replication** — the current month's parquet was written
    within ``MAX_EXPORT_LAG_HOURS`` and its ``ReplicationStatus`` is
    COMPLETED, i.e. it reached the consumer bucket.
-5. **upstream agreement** — sampled diff of stored NAVs and date sets
-   against 天天基金. Checks 1-4 only inspect our own output, so a
+5. **history exports** — age AND distinct-fund count of the three flat
+   files under ``fund/_history/``. Checks 1-4 only look at fund_daily and
+   the monthly export, which is why fund_scale_history could stall for a
+   month and fund_manager_history could shed ~1,000 funds per weekly run
+   with every check green (both found 2026-08-10).
+6. **upstream agreement** — sampled diff of stored NAVs and date sets
+   against 天天基金. The other checks only inspect our own output, so a
    transform bug is invisible to them; the weekend date-offset defect
    shipped for two months with all of them green.
 """
@@ -264,6 +269,100 @@ def _check_export(problems: List[str], facts: List[str]) -> None:
         )
 
 
+# The three flat files under fund/_history/ that the consumer reads directly,
+# with the age at which each is genuinely stale. These are refreshed on their
+# own schedules (manager weekly, scale monthly, portfolio quarterly), so a
+# single threshold would either nag or miss.
+#
+# Nothing watched these until 2026-08-10, and both defects found that day were
+# invisible for exactly that reason: fund_scale_history stopped updating after
+# 2026-07-04 and went unnoticed for over a month (consumers screening
+# liquidation risk read 3/31 figures), while fund_manager_history silently
+# dropped ~1,000 rate-limited funds every weekly run. Checks 1-5 all stayed
+# green throughout — they only ever looked at fund_daily and the monthly
+# export.
+# (max age in days, minimum distinct funds). Both numbers are calibrated by
+# replaying the two 2026-08-10 defects against them; a first pass at
+# (40 days, 24000 funds) would have MISSED both, which is the whole point of
+# the check:
+#
+# - scale stalled after 2026-07-04 and was 37 days old when found — under a
+#   40-day threshold. A monthly refresh should never be more than ~35 days
+#   old, so 33 catches a single missed run without nagging.
+# - manager shed 988 funds to 26,299 — above a 24,000 floor. The floor has to
+#   sit just under the real population (~27.3k) to catch a partial refresh,
+#   not at a round number well below it.
+#
+# The fund floor is per-file, not shared: the portfolio file legitimately
+# covers only ~15.3k funds because money-market and pure-bond products have no
+# 股票投资明细 to disclose and the backfill skips them on purpose. A single 20k
+# floor fires a false alarm on it every day — measured before shipping.
+_HISTORY_FILES = {
+    "fund_manager_history": (10, 26500),          # weekly refresh, ~27.3k funds
+    "fund_scale_history": (33, 26000),            # monthly refresh, ~27.0k funds
+    "fund_portfolio_hold_history": (100, 14000),  # quarterly, equity-like only
+}
+
+
+def _check_history_exports(problems: List[str], facts: List[str]) -> None:
+    """Age + row-count check on the flat history files.
+
+    Row count matters as much as age here: the manager-history defect
+    republished the file every week, so it always looked fresh while ~1,000
+    funds were missing from it. A sudden drop in distinct funds is the only
+    consumer-visible symptom.
+    """
+    import io
+
+    import pandas as pd
+
+    s3 = boto3.client("s3", region_name=REGION)
+    for base, (max_age_days, min_funds) in _HISTORY_FILES.items():
+        key = f"{S3_PREFIX}fund/_history/{base}.parquet"
+        try:
+            head = s3.head_object(Bucket=BUCKET, Key=key)
+        except Exception as e:
+            problems.append(f"历史文件缺失或不可读: `{base}` ({type(e).__name__})")
+            continue
+
+        age_d = (datetime.now(timezone.utc) - head["LastModified"]).days
+        try:
+            obj = s3.get_object(Bucket=BUCKET, Key=key)
+            raw = io.BytesIO(obj["Body"].read())
+            # The two Lambda-produced files keep upstream's Chinese headers;
+            # the portfolio file is built by the Fargate backfill and carries
+            # normalized English ones. Resolve the name from the footer schema
+            # so only the one needed column is decoded.
+            import pyarrow.parquet as pq
+
+            names = pq.ParquetFile(raw).schema_arrow.names
+            code_col = next(
+                (c for c in ("基金代码", "fund_code") if c in names), None
+            )
+            if code_col is None:
+                problems.append(f"`{base}` 找不到基金代码列（列: {names[:6]}）")
+                continue
+            raw.seek(0)
+            n_funds = pd.read_parquet(raw, columns=[code_col])[code_col].nunique()
+        except Exception as e:
+            problems.append(f"`{base}` 无法解析: {type(e).__name__}: {e}")
+            continue
+
+        facts.append(f"历史 `{base}` {n_funds:,} 只 / {age_d} 天前更新")
+
+        if age_d > max_age_days:
+            problems.append(
+                f"`{base}` 已 {age_d} 天未更新（阈值 {max_age_days} 天）"
+            )
+        # A drop below the floor means a refresh published a partial file —
+        # the failure mode that cost 988 funds on 2026-08-09.
+        if n_funds < min_funds:
+            problems.append(
+                f"`{base}` 只有 {n_funds:,} 只基金"
+                f"（阈值 {min_funds:,}）— 可能是部分刷新覆盖了完整数据"
+            )
+
+
 def _check_workflow(problems: List[str], facts: List[str]) -> None:
     """Report on today's collection run so the heartbeat says how it went.
 
@@ -435,7 +534,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     facts: List[str] = []
 
     for check in (_check_workflow, _check_fund_daily, _check_export,
-                  _check_upstream):
+                  _check_history_exports, _check_upstream):
         try:
             check(problems, facts)
         except Exception as e:

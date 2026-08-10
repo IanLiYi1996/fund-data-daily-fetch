@@ -10,6 +10,8 @@ from __future__ import annotations
 import concurrent.futures
 import datetime as dt
 import json
+import os
+import random
 import re
 import time
 from typing import Callable, Optional, Protocol
@@ -195,6 +197,26 @@ class EastMoneyHttpClient:
         return r.text
 
 
+# 天天基金 answers a frequency cap with HTTP 514 (not 429), so the status code
+# has to be matched explicitly.
+_RATE_LIMIT_STATUSES = (429, 503, 514)
+# Seconds; doubles per attempt, jittered. The cap is bursty rather than a
+# hard per-second ceiling — 32 concurrent requests over 100 codes measured
+# zero 514s, while a full 27.5k-code run logged 3.7% capped — so a short
+# wait usually clears it and a long one is wasted.
+_RATE_LIMIT_BASE_DELAY = float(os.environ.get("HISTORY_RATE_LIMIT_DELAY", "1.5"))
+# Never sleep a worker when less than this much of the invocation remains;
+# finishing the remaining codes beats retrying one.
+_DEADLINE_RESERVE_SECONDS = 90.0
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in _RATE_LIMIT_STATUSES:
+        return True
+    return "Frequency Capped" in str(exc)
+
+
 class FundHistoryFetcher:
     """Concurrently fetches per-fund manager tenure and scale history."""
 
@@ -202,7 +224,7 @@ class FundHistoryFetcher:
         self,
         client: Optional[HttpClient] = None,
         max_workers: int = 8,
-        max_retries: int = 3,
+        max_retries: int = 5,
         retry_delay: float = 0.5,
     ):
         self._client = client if client is not None else EastMoneyHttpClient()
@@ -211,7 +233,10 @@ class FundHistoryFetcher:
         self._retry_delay = retry_delay
 
     def fetch_manager_history(
-        self, fund_codes: list[str], snapshot_date: dt.date
+        self,
+        fund_codes: list[str],
+        snapshot_date: dt.date,
+        remaining: Optional[Callable[[], float]] = None,
     ) -> tuple[pd.DataFrame, list[dict]]:
         return self._run_parallel(
             fund_codes=fund_codes,
@@ -219,10 +244,14 @@ class FundHistoryFetcher:
             fetch_fn=self._client.fetch_manager_html,
             parse_fn=parse_manager_change_html,
             empty_columns=_MANAGER_COLUMNS,
+            remaining=remaining,
         )
 
     def fetch_scale_history(
-        self, fund_codes: list[str], snapshot_date: dt.date
+        self,
+        fund_codes: list[str],
+        snapshot_date: dt.date,
+        remaining: Optional[Callable[[], float]] = None,
     ) -> tuple[pd.DataFrame, list[dict]]:
         return self._run_parallel(
             fund_codes=fund_codes,
@@ -230,6 +259,7 @@ class FundHistoryFetcher:
             fetch_fn=self._client.fetch_pingzhongdata,
             parse_fn=parse_scale_fluctuation,
             empty_columns=_SCALE_COLUMNS,
+            remaining=remaining,
         )
 
     def _run_parallel(
@@ -239,6 +269,7 @@ class FundHistoryFetcher:
         fetch_fn: Callable[[str], str],
         parse_fn: Callable[[str, str], pd.DataFrame],
         empty_columns: list[str],
+        remaining: Optional[Callable[[], float]] = None,
     ) -> tuple[pd.DataFrame, list[dict]]:
         if not fund_codes:
             empty = pd.DataFrame(columns=empty_columns + ["snapshot_date"])
@@ -256,8 +287,29 @@ class FundHistoryFetcher:
                 except Exception as exc:
                     if attempt >= self._max_retries:
                         return code, None, f"{type(exc).__name__}: {exc}"
-                    if self._retry_delay > 0:
-                        time.sleep(self._retry_delay * attempt)
+                    # Rate limiting needs a different backoff than a transient
+                    # error. Linear 0.5s/1.0s retries against a frequency cap
+                    # burn all attempts inside the same capped window: the
+                    # 2026-08-09 run lost 1,008 of ~27.5k codes to
+                    # `514 Frequency Capped` with every attempt exhausted.
+                    if _is_rate_limited(exc):
+                        delay = _RATE_LIMIT_BASE_DELAY * (2 ** (attempt - 1))
+                        # Jitter so the whole thread pool doesn't retry in
+                        # lockstep and re-trip the cap together.
+                        delay *= 0.5 + random.random()
+                    else:
+                        delay = self._retry_delay * attempt
+                    # Sleeping past the invocation deadline turns a recoverable
+                    # miss into a lost partition, which is strictly worse: the
+                    # merge now carries funds forward, so giving up on one code
+                    # costs a stale row, not a deleted one.
+                    if remaining is not None:
+                        budget = remaining() - _DEADLINE_RESERVE_SECONDS
+                        if budget <= 0:
+                            return code, None, f"deadline: {type(exc).__name__}"
+                        delay = min(delay, budget)
+                    if delay > 0:
+                        time.sleep(delay)
             return code, None, "exceeded retries"
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self._max_workers) as pool:

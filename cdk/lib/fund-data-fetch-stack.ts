@@ -890,20 +890,33 @@ export class FundDataFetchStack extends Stack {
       })
     );
 
-    // Quarterly: scale history full refresh — Jan/Apr/Jul/Oct 4th at 19:00 UTC
-    // (3-day buffer after quarter end so most fund-of-quarter data is published)
+    // Monthly: scale history full refresh — 25th at 19:00 UTC.
+    //
+    // Was quarterly on the 4th of Jan/Apr/Jul/Oct, described as a "3-day
+    // buffer after quarter end". That premise was wrong: funds have 15
+    // working days after quarter end to publish a quarterly report, so a
+    // run on the 4th sees almost none of it. Measured on 2026-08-10, the
+    // 2026-06-30 report period held 30 funds against ~26,600 in the table —
+    // Q2 was effectively absent and consumers screening liquidation risk
+    // (net assets < 2亿) were still reading 3/31 figures four months on.
+    //
+    // Monthly rather than quarterly on purpose. Quarterly means one run per
+    // disclosure window, so a single bad run leaves the table stale until
+    // the next quarter — exactly what happened here. Monthly re-reads the
+    // same pingzhongdata endpoint the weekly manager refresh already hits at
+    // this volume, and lets a missed window self-heal in 30 days.
     const scaleHistoryRule = new events.Rule(
       this,
       "FundScaleHistoryQuarterlySchedule",
       {
         ruleName: "FundScaleHistoryQuarterlySchedule",
         description:
-          "Quarterly full refresh of fund_scale_history (Jan/Apr/Jul/Oct 4th 19:00 UTC)",
+          "Monthly full refresh of fund_scale_history (25th 19:00 UTC)",
         schedule: events.Schedule.cron({
           minute: "0",
           hour: "19",
-          day: "4",
-          month: "1,4,7,10",
+          day: "25",
+          month: "*",
         }),
       }
     );
