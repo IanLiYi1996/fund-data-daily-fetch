@@ -166,7 +166,11 @@ def _check_fund_daily(problems: List[str], facts: List[str]) -> None:
             f"fund_daily 最新数据是 `{newest}`，滞后 {lag} 天"
             f"（阈值 {MAX_LAG_DAYS} 天）"
         )
-    if n_funds < MIN_FUNDS:
+    # Only score trading days. On weekends just the ~570 money-market funds
+    # accrue, so a 20k floor reports a correct Sunday as a partial write —
+    # which it did on 2026-08-09. The coverage check below already filters
+    # to trading days; this older floor did not.
+    if newest.weekday() < 5 and n_funds < MIN_FUNDS:
         problems.append(
             f"fund_daily `{newest}` 只有 {n_funds:,} 只基金"
             f"（阈值 {MIN_FUNDS:,}）— 可能是部分写入"

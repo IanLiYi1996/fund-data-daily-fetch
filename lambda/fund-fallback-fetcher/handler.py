@@ -116,6 +116,15 @@ def _get_missing_universe(
         fn[fn.snapshot_date == latest].drop_duplicates("fund_code").reset_index(drop=True)
     )
 
+    # On non-trading days only money-market funds accrue, so scoping the gap
+    # to the full universe asks for ~27k codes and guarantees a timeout — the
+    # 2026-08-08 run hit exactly that. Restrict to 货币型 instead.
+    if end_date.weekday() >= 5 and "fund_type" in fn_latest.columns:
+        fn_latest = fn_latest[
+            fn_latest.fund_type.fillna("").str.startswith("货币型")
+        ].reset_index(drop=True)
+        logger.info(f"non-trading day: scoped to {len(fn_latest):,} money-market funds")
+
     # "Covered" means a usable NAV, not merely a row. The main snapshot
     # endpoint returns rows for funds it has no value for (both date columns
     # blank), and treating those as covered made the fallback skip them —
@@ -136,6 +145,29 @@ def _get_missing_universe(
     }
 
     return fn_latest[~fn_latest.fund_code.isin(covered)][["fund_code", "fund_name"]]
+
+
+def _existing_pairs(catalog, start_date: date, end_date: date) -> set:
+    """(fund_code, trade_date) pairs that already hold a NAV in the window.
+
+    Used to keep the fallback from re-appending rows it fetched on previous
+    days. Pairs with a NULL NAV are deliberately excluded so they remain
+    eligible for a real value.
+    """
+    arrow = catalog.load_table((DATABASE, "fund_daily")).scan(
+        row_filter=And(
+            GreaterThanOrEqual("trade_date", start_date),
+            LessThanOrEqual("trade_date", end_date),
+        ),
+        selected_fields=("fund_code", "trade_date", "unit_nav"),
+    ).to_arrow()
+    return {
+        (c, d)
+        for c, d, v in zip(arrow["fund_code"].to_pylist(),
+                           arrow["trade_date"].to_pylist(),
+                           arrow["unit_nav"].to_pylist())
+        if v is not None
+    }
 
 
 def _latest_loaded_date(catalog) -> Optional[date]:
@@ -232,9 +264,38 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         }
 
     merged = pd.concat(frames, ignore_index=True)
+
+    # Write only rows we don't already hold. The fetch window spans 14 days so
+    # hold-period products' disclosure dates fall inside it, but appending the
+    # whole window every day duplicated rows we already had: fund_daily is
+    # append-mode, so by 2026-08-07 the table carried 71,889 rows for 25,649
+    # funds — nearly 3x — and 319,234 duplicates overall. Weekly compaction
+    # dedups, but daily accumulation outpaced it.
+    #
+    # Keep the target day plus any earlier date genuinely missing a NAV, so
+    # periodic-open funds still get backfilled the first time we see their
+    # disclosure.
+    existing = _existing_pairs(catalog, start_date, end_date)
+    before = len(merged)
+    merged = merged[
+        ~merged.apply(
+            lambda r: (r.fund_code, r.trade_date) in existing, axis=1
+        )
+    ]
     logger.info(
-        f"Recovered {merged.fund_code.nunique():,} funds, {len(merged):,} rows"
+        f"Recovered {merged.fund_code.nunique():,} funds, {len(merged):,} rows "
+        f"(dropped {before - len(merged):,} already present)"
     )
+    if merged.empty:
+        return {
+            "statusCode": 200,
+            "downloader": "fund-fallback",
+            "success": True,
+            "missing": len(missing),
+            "fetched": 0,
+            "rows_appended": 0,
+            "elapsed_seconds": (datetime.utcnow() - started).total_seconds(),
+        }
 
     writer = IcebergWriter(
         database=DATABASE, warehouse=WAREHOUSE, subprocess_mode=False,
