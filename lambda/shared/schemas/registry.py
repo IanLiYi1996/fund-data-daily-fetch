@@ -399,6 +399,11 @@ TABLES["fund_inactive"] = TableSpec(
         NestedField(2, "reason", StringType()),
         NestedField(3, "last_seen_date", DateType()),
         NestedField(4, "verified_at", DateType(), required=True),
+        # Lifecycle status for consumers: stalled (停更, may resume) vs
+        # terminated (已终止, drop it). `reason` records how we detected
+        # silence; it cannot answer "will this fund come back?", which is the
+        # question a screening universe actually needs (asked 2026-08-10).
+        NestedField(5, "status", StringType()),
         identifier_field_ids=[1],
     ),
     partition_spec=PartitionSpec(

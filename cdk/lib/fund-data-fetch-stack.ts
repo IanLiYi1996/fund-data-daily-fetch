@@ -972,7 +972,12 @@ export class FundDataFetchStack extends Stack {
       lambdaDir,
       "freshness-check/Dockerfile",
       "Assert freshness, coverage, replication and upstream agreement",
-      1024,
+      // 3008 MB, up from 1024: the lifecycle export has to find each fund's
+      // last NAV date across all of fund_daily (~30.6M rows), and the scan
+      // alone peaked at 1,025 MB of a 1,024 MB budget — the runtime was
+      // OOM-killed. Aggregation itself now happens in Arrow rather than
+      // pandas, but the scan still has to materialize.
+      3008,
       10,
       {
         ...lambdaEnv,

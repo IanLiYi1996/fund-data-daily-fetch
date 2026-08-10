@@ -48,15 +48,19 @@ def test_write_mode_valid(name):
 
 def test_fund_daily_pk_is_code_and_trade_date():
     assert TABLES["fund_daily"].identifier_fields == ["fund_code", "trade_date"]
-    assert TABLES["fund_daily"].write_mode == "upsert"
+    # append, not upsert: the fallback fetcher adds rows for codes the main
+    # snapshot missed, and pyiceberg upsert on a 30M-row table was too slow to
+    # finish inside the Lambda window. Weekly compaction dedups instead, and
+    # the consumer export prefers a non-null NAV per (code, date).
+    assert TABLES["fund_daily"].write_mode == "append"
 
 
 def test_fund_dividend_is_append_event():
     assert TABLES["fund_dividend"].write_mode == "append"
 
 
-def test_table_count_is_27():
-    assert len(TABLES) == 27, f"Expected 27 tables, got {len(TABLES)}"
+def test_table_count_is_28():
+    assert len(TABLES) == 28, f"Expected 28 tables, got {len(TABLES)}"
 
 
 def test_expected_table_names():
@@ -75,6 +79,10 @@ def test_expected_table_names():
         "fund_index_info", "fund_portfolio_hold", "fund_name", "fund_manager",
         # Domain 5: K-line history
         "kline_a", "kline_hk", "kline_us",
+        # Domain 6: lifecycle — codes that have stopped reporting. Derived
+        # daily by the freshness check rather than hand-maintained, and
+        # exported so consumers can tell 停更 from 已终止.
+        "fund_inactive",
     }
     assert set(TABLES) == expected
 
@@ -87,7 +95,7 @@ def test_expected_table_names():
     "fund_money_rank", "fund_hk_rank", "fund_dividend_rank", "fund_rating",
     "fund_dividend", "fund_split", "fund_purchase", "fund_index_info",
     "fund_portfolio_hold", "fund_name", "fund_manager",
-    "kline_a", "kline_hk", "kline_us",
+    "kline_a", "kline_hk", "kline_us", "fund_inactive",
 }))
 def test_all_specs_consistent(name):
     spec = TABLES[name]

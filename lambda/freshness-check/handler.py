@@ -421,8 +421,72 @@ def _has_upstream_series(fund_code: str) -> bool:
         return True
 
 
+# Lifecycle status values published to consumers. The distinction consumers
+# asked for (2026-08-10) is 停更 vs 已终止: a fund that has merely paused
+# disclosure may resume and should stay in a screening universe, while a
+# liquidated/delisted one must be dropped. `reason` alone could not express
+# that — it recorded how we detected silence, not what the silence means.
+STATUS_ACTIVE = "active"        # disclosed within INACTIVE_AFTER_DAYS
+STATUS_STALLED = "stalled"      # 停更: silent, but upstream still lists a series
+STATUS_TERMINATED = "terminated"  # 已终止: silent AND no upstream series
+STATUS_NEVER = "never_reported"  # in fund_name, never produced a NAV
+# Silent a long time and not yet probed. Reported separately from `stalled`
+# because calling these "may resume" is misleading: measured 2026-08-10, 31 of
+# 52 unprobed silent codes had been quiet for over a YEAR (max 3,603 days —
+# ~10 years). No consumer should keep those in a screening universe, but we
+# also haven't confirmed them dead, so they must not be labelled terminated.
+STATUS_PRESUMED_DEAD = "presumed_terminated"
+# Beyond this, silence stops being plausibly a disclosure cadence. The longest
+# legitimate gap is a quarterly-hold product plus reporting lag; a year is far
+# outside that.
+PRESUMED_DEAD_AFTER_DAYS = int(os.environ.get("PRESUMED_DEAD_AFTER_DAYS", "365"))
+
+
+def _lifecycle_status(has_series: bool, last_seen: Optional[date]) -> str:
+    """Classify a silent fund.
+
+    Upstream presence is the discriminator, not elapsed time: a 3-month-hold
+    FOF can be silent for 90 days and still be perfectly alive, so ageing
+    alone would wrongly declare it terminated. 天天基金 drops the NAV series
+    for liquidated and delisted products, which is what makes this checkable.
+    """
+    if last_seen is None and not has_series:
+        return STATUS_TERMINATED
+    if last_seen is None:
+        return STATUS_NEVER
+    return STATUS_STALLED if has_series else STATUS_TERMINATED
+
+
+def _last_nav_dates(catalog, codes: List[str]) -> Dict[str, date]:
+    """Newest trade_date holding a real NAV, per code, over all history.
+
+    Scans the full table rather than a recent window on purpose: these codes
+    are silent by definition, so a windowed scan returns nothing for exactly
+    the funds being classified. Only the two needed columns are read.
+    """
+    if not codes:
+        return {}
+    import pyarrow.compute as pc
+    from pyiceberg.expressions import In
+
+    # Push the code filter into the scan and aggregate in Arrow. Materializing
+    # ~30M rows here (even column-projected) is what OOM-killed a 1 GB Lambda.
+    arrow = catalog.load_table(("fund_data_lake", "fund_daily")).scan(
+        row_filter=In("fund_code", codes),
+        selected_fields=("fund_code", "trade_date", "unit_nav"),
+    ).to_arrow()
+    if arrow.num_rows == 0:
+        return {}
+    arrow = arrow.filter(pc.is_valid(arrow["unit_nav"]))
+    if arrow.num_rows == 0:
+        return {}
+    grouped = arrow.group_by("fund_code").aggregate([("trade_date", "max")])
+    return dict(zip(grouped["fund_code"].to_pylist(),
+                    grouped["trade_date_max"].to_pylist()))
+
+
 def _maintain_exemptions(facts: List[str]) -> None:
-    """Age codes into and out of fund_inactive.
+    """Age codes into and out of fund_inactive, and classify their lifecycle.
 
     Hand-maintained lists rot. The estimate that ~900 money-market funds were
     missing sat in an issue for weeks after the fallback Lambda had already
@@ -434,6 +498,10 @@ def _maintain_exemptions(facts: List[str]) -> None:
              successive days.
     Age OUT: reappeared in fund_daily. Removed immediately — a resumed fund
              must not stay invisible to the coverage check.
+
+    Also fills ``last_seen_date`` and ``status``. Both were left null/absent,
+    which is exactly what blocked consumers from telling 停更 from 已终止 —
+    they could see a fund was silent but not whether it would ever return.
     """
     import pandas as pd
 
@@ -466,23 +534,36 @@ def _maintain_exemptions(facts: List[str]) -> None:
         table.overwrite(arrow)
         logger.info(f"aged out {len(revived)}: {revived[:10]}")
 
-    added = []
-    for code in candidates[:MAX_AGE_IN_PROBES]:
-        if not _has_upstream_series(code):
-            added.append(code)
+    # Last date each candidate produced a real NAV, over all history — the
+    # field consumers need to judge how long a fund has been quiet. It was
+    # written as None for every row until 2026-08-10, so the table could say
+    # "inactive" but not "since when".
+    last_seen = _last_nav_dates(catalog, candidates[:MAX_AGE_IN_PROBES])
 
-    if added:
-        writer.write("fund_inactive", pd.DataFrame({
-            "fund_code": added,
-            "reason": ["no_upstream_series"] * len(added),
-            "last_seen_date": [None] * len(added),
-            "verified_at": [date.today()] * len(added),
-        }), fetch_date=date.today())
-        logger.info(f"aged in {len(added)}")
+    rows = []
+    for code in candidates[:MAX_AGE_IN_PROBES]:
+        has_series = _has_upstream_series(code)
+        seen = last_seen.get(code)
+        status = _lifecycle_status(has_series, seen)
+        # A stalled fund is NOT exempted from the coverage check: it is still
+        # expected to report, so hiding it would suppress a real gap. Only
+        # genuinely dead codes earn an exemption.
+        if status in (STATUS_TERMINATED, STATUS_NEVER):
+            rows.append({
+                "fund_code": code,
+                "reason": "no_upstream_series",
+                "last_seen_date": seen,
+                "verified_at": date.today(),
+                "status": status,
+            })
+
+    if rows:
+        writer.write("fund_inactive", pd.DataFrame(rows), fetch_date=date.today())
+        logger.info(f"aged in {len(rows)}")
 
     parts = []
-    if added:
-        parts.append(f"新增豁免 {len(added)}")
+    if rows:
+        parts.append(f"新增豁免 {len(rows)}")
     if revived:
         parts.append(f"复活移出 {len(revived)}")
     pending = max(0, len(candidates) - MAX_AGE_IN_PROBES)
@@ -490,6 +571,101 @@ def _maintain_exemptions(facts: List[str]) -> None:
         parts.append(f"待探测 {pending}")
     if parts:
         facts.append("豁免名单维护: " + " / ".join(parts))
+
+    _export_lifecycle(catalog, facts)
+
+
+def _export_lifecycle(catalog, facts: List[str]) -> None:
+    """Publish fund lifecycle status to the consumer-readable prefix.
+
+    The table existed and was maintained daily, but lived only in our Iceberg
+    warehouse — consumers had no way to read it, which is why they asked for a
+    status field they in effect already had. Writing it under fund/_history/
+    puts it in the same replicated location as the other flat files.
+
+    Covers the WHOLE universe, not just the exempt list: a consumer building a
+    screening universe needs a verdict for every code, and "absent from this
+    file" is not a usable answer.
+    """
+    import io
+
+    import pandas as pd
+
+    fn = catalog.load_table(("fund_data_lake", "fund_name")).scan(
+        selected_fields=("fund_code", "fund_name", "fund_type", "snapshot_date"),
+    ).to_arrow().to_pandas()
+    if fn.empty:
+        return
+    fn = (fn[fn.snapshot_date == fn.snapshot_date.max()]
+          .drop_duplicates("fund_code").reset_index(drop=True))
+
+    # Aggregate in Arrow, never via pandas. fund_daily is ~30M rows; calling
+    # .to_pandas() on it used 1,025 MB of a 1,024 MB Lambda and the runtime
+    # was killed. group_by on the Arrow table keeps this bounded.
+    import pyarrow.compute as pc
+
+    arrow = catalog.load_table(("fund_data_lake", "fund_daily")).scan(
+        selected_fields=("fund_code", "trade_date", "unit_nav"),
+    ).to_arrow()
+    arrow = arrow.filter(pc.is_valid(arrow["unit_nav"])).drop_columns(["unit_nav"])
+    grouped = arrow.group_by("fund_code").aggregate([("trade_date", "max")])
+    last = pd.Series(
+        grouped["trade_date_max"].to_pylist(),
+        index=grouped["fund_code"].to_pylist(),
+    )
+    del arrow, grouped
+    newest = last.max()
+
+    try:
+        inactive = catalog.load_table(
+            ("fund_data_lake", "fund_inactive")
+        ).scan().to_arrow().to_pandas().set_index("fund_code")
+    except Exception:
+        inactive = pd.DataFrame()
+
+    out = fn[["fund_code", "fund_name", "fund_type"]].copy()
+    out["last_nav_date"] = out.fund_code.map(last)
+    # trade_date arrives as python date objects, so subtraction yields
+    # timedelta objects rather than a datetime64 series — .dt is unavailable.
+    out["lag_days"] = out.last_nav_date.map(
+        lambda d: None if pd.isna(d) else (newest - d).days
+    )
+
+    def _status(row) -> str:
+        if pd.isna(row.last_nav_date):
+            # Recorded terminations win over "never seen": a code we probed and
+            # found dead is a stronger statement than absence from fund_daily.
+            if not inactive.empty and row.fund_code in inactive.index:
+                return str(inactive.loc[row.fund_code].get("status") or STATUS_TERMINATED)
+            return STATUS_NEVER
+        if row.lag_days <= INACTIVE_AFTER_DAYS:
+            return STATUS_ACTIVE
+        if not inactive.empty and row.fund_code in inactive.index:
+            return str(inactive.loc[row.fund_code].get("status") or STATUS_TERMINATED)
+        # Silent past the window but never probed. Not `terminated` — that
+        # would quietly evict live hold-period products (a 3-month-hold FOF is
+        # legitimately silent). But not plain `stalled` either once the silence
+        # runs to a year: see STATUS_PRESUMED_DEAD.
+        if row.lag_days is not None and row.lag_days > PRESUMED_DEAD_AFTER_DAYS:
+            return STATUS_PRESUMED_DEAD
+        return STATUS_STALLED
+
+    out["status"] = out.apply(_status, axis=1)
+    out["as_of"] = newest
+
+    buf = io.BytesIO()
+    out.to_parquet(buf, engine="pyarrow", index=False)
+    key = f"{S3_PREFIX}fund/_history/fund_lifecycle.parquet"
+    boto3.client("s3", region_name=REGION).put_object(
+        Bucket=BUCKET, Key=key, Body=buf.getvalue(),
+        ContentType="application/x-parquet",
+    )
+    counts = out.status.value_counts().to_dict()
+    facts.append(
+        "生命周期导出: "
+        + " / ".join(f"{k} {v:,}" for k, v in sorted(counts.items()))
+    )
+    logger.info(f"wrote {key}: {len(out):,} rows {counts}")
 
 
 def _check_upstream(problems: List[str], facts: List[str]) -> None:
