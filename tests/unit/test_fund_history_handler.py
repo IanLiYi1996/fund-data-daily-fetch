@@ -330,3 +330,103 @@ def test_handler_merge_no_parts_returns_empty_result(handler_module, real_s3):
     # No canonical file should exist either
     listed = real_s3.list_objects_v2(Bucket=BUCKET, Prefix="fund/_history/")
     assert not listed.get("Contents")
+
+
+# ---- carry-forward on merge (regression: 2026-08-10 missing managers) ----
+#
+# The merge published `concat(this week's part files)` straight over the
+# canonical file, so the published artifact was a snapshot of whatever one run
+# collected rather than accumulated best-known state. Upstream rate-limits us
+# (HTTP 514 Frequency Capped); the 2026-08-09 run logged error_count=1008 of
+# ~27.5k codes, and every one of those funds silently disappeared from the file
+# consumers read. 110022 易方达消费行业股票 lost a manager tenure that way, which
+# broke a downstream screening rule that requires tenure >= 3 years.
+
+
+def test_merge_carries_forward_funds_missing_from_this_run(handler_module, real_s3):
+    """A fund absent from this run keeps its previous rows."""
+    from shared.storage import S3Client
+    import io
+
+    prior = pd.DataFrame([
+        {"基金代码": "110022", "经理姓名": "萧楠", "任期天数": 485},
+        {"基金代码": "000001", "经理姓名": "张三", "任期天数": 100},
+    ])
+    _put_parquet(real_s3, CANONICAL_KEY, prior)
+
+    # This run only got 000001 — 110022 hit the frequency cap.
+    _put_parquet(
+        real_s3,
+        f"{STAGING_PREFIX}/fund_manager_history__part0.parquet",
+        pd.DataFrame([{"基金代码": "000001", "经理姓名": "张三", "任期天数": 107}]),
+    )
+
+    result = handler_module.run(
+        event={"mode": "manager_merge", "partition_total": 1},
+        fetcher=MagicMock(),
+        s3_client=S3Client(BUCKET),
+        boto3_s3=real_s3,
+    )
+
+    obj = real_s3.get_object(Bucket=BUCKET, Key=CANONICAL_KEY)
+    merged = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+
+    assert set(merged["基金代码"]) == {"000001", "110022"}, (
+        "a rate-limited fund must not vanish from the published file"
+    )
+    assert result["funds_carried_forward"] == 1
+    # The refreshed fund takes this run's value, not the stale one.
+    assert merged.loc[merged["基金代码"] == "000001", "任期天数"].tolist() == [107]
+
+
+def test_merge_replaces_refreshed_fund_wholesale(handler_module, real_s3):
+    """A fund present in this run has ALL its old rows dropped.
+
+    Each run re-fetches a fund's full history, so this run is authoritative
+    for that fund. Row-level dedup instead of fund-level replacement would
+    resurrect tenures upstream has since corrected or removed.
+    """
+    from shared.storage import S3Client
+    import io
+
+    _put_parquet(real_s3, CANONICAL_KEY, pd.DataFrame([
+        {"基金代码": "110011", "经理姓名": "张坤", "是否现任": True},
+        {"基金代码": "110011", "经理姓名": "已撤销的记录", "是否现任": True},
+    ]))
+    _put_parquet(
+        real_s3,
+        f"{STAGING_PREFIX}/fund_manager_history__part0.parquet",
+        pd.DataFrame([{"基金代码": "110011", "经理姓名": "张坤", "是否现任": True}]),
+    )
+
+    handler_module.run(
+        event={"mode": "manager_merge", "partition_total": 1},
+        fetcher=MagicMock(),
+        s3_client=S3Client(BUCKET),
+        boto3_s3=real_s3,
+    )
+
+    obj = real_s3.get_object(Bucket=BUCKET, Key=CANONICAL_KEY)
+    merged = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+    assert merged["经理姓名"].tolist() == ["张坤"]
+
+
+def test_merge_without_prior_canonical_publishes_as_is(handler_module, real_s3):
+    """First-ever merge has nothing to carry forward."""
+    from shared.storage import S3Client
+
+    _put_parquet(
+        real_s3,
+        f"{STAGING_PREFIX}/fund_scale_history__part0.parquet",
+        pd.DataFrame([{"基金代码": "000001", "期末净资产_亿元": 12.3}]),
+    )
+
+    result = handler_module.run(
+        event={"mode": "scale_merge", "partition_total": 1},
+        fetcher=MagicMock(),
+        s3_client=S3Client(BUCKET),
+        boto3_s3=real_s3,
+    )
+
+    assert result["funds_carried_forward"] == 0
+    assert result["row_count"] == 1

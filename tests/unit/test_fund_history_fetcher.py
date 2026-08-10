@@ -110,3 +110,81 @@ def test_empty_input_returns_empty_dataframe():
     assert df.empty
     assert "基金代码" in df.columns
     assert errors == []
+
+
+# --- rate limiting (regression: 2026-08-09 lost 1,008 funds to HTTP 514) ---
+
+
+class _CappedResponse:
+    """Stands in for requests' response object on a frequency-capped call."""
+
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+
+
+def _rate_limit_error(status: int = 514) -> Exception:
+    exc = RuntimeError(f"{status} Server Error: Frequency Capped")
+    exc.response = _CappedResponse(status)
+    return exc
+
+
+def test_rate_limit_uses_longer_backoff_than_transient_error(monkeypatch):
+    """514 must not be retried on the transient-error schedule.
+
+    Upstream answers a frequency cap with HTTP 514, and the old linear
+    0.5s/1.0s backoff spent all three attempts inside the same capped
+    window — 1,008 of ~27.5k codes were dropped on 2026-08-09.
+    """
+    from shared.fetchers import fund_history_fetcher as mod
+
+    slept: list[float] = []
+    monkeypatch.setattr(mod.time, "sleep", lambda s: slept.append(s))
+    # Remove jitter so the assertion is on the schedule, not the sample.
+    monkeypatch.setattr(mod.random, "random", lambda: 0.5)
+
+    client = FakeClient()
+    calls = {"n": 0}
+
+    def capped(fund_code: str) -> str:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _rate_limit_error()
+        return FakeClient.fetch_manager_html(client, fund_code)
+
+    client.fetch_manager_html = capped
+    fetcher = FundHistoryFetcher(
+        client=client, max_workers=1, max_retries=5, retry_delay=0.5,
+    )
+    df, errors = fetcher.fetch_manager_history(
+        ["000001"], snapshot_date=dt.date(2026, 5, 14),
+    )
+
+    assert errors == []
+    assert len(df) == 1
+    # Both waits must exceed the transient schedule (0.5s, 1.0s) and double.
+    assert len(slept) == 2
+    assert slept[0] > 1.0
+    assert slept[1] == pytest.approx(slept[0] * 2)
+
+
+def test_rate_limit_backoff_respects_invocation_deadline(monkeypatch):
+    """Never sleep past the deadline — a lost partition is worse than a
+    stale row now that the merge carries funds forward."""
+    from shared.fetchers import fund_history_fetcher as mod
+
+    slept: list[float] = []
+    monkeypatch.setattr(mod.time, "sleep", lambda s: slept.append(s))
+
+    client = FakeClient()
+    client.fetch_manager_html = lambda code: (_ for _ in ()).throw(_rate_limit_error())
+    fetcher = FundHistoryFetcher(client=client, max_workers=1, max_retries=5)
+
+    df, errors = fetcher.fetch_manager_history(
+        ["000001"],
+        snapshot_date=dt.date(2026, 5, 14),
+        remaining=lambda: 10.0,  # less than the 90s reserve
+    )
+
+    assert slept == [], "must not sleep when the invocation is nearly over"
+    assert len(errors) == 1
+    assert "deadline" in errors[0]["error"]
