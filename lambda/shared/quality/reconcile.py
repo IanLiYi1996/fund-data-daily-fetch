@@ -121,6 +121,22 @@ def _build_sample(catalog, rng: random.Random) -> List[tuple]:
 
 
 
+def _latest_loaded_date(catalog) -> Optional[date]:
+    """Newest trade_date present in fund_daily.
+
+    Same reasoning as the fallback fetcher's copy: collection runs at 17:00
+    UTC, so between 00:00 and 17:00 "today" holds nothing and using it as the
+    upper bound makes a full day look missing.
+    """
+    since = date.today() - timedelta(days=10)
+    arrow = catalog.load_table((DATABASE, "fund_daily")).scan(
+        row_filter=GreaterThanOrEqual("trade_date", since),
+        selected_fields=("trade_date",),
+    ).to_arrow()
+    days = arrow["trade_date"].to_pylist()
+    return max(days) if days else None
+
+
 def reconcile(catalog, seed: Optional[int] = None) -> Dict:
     """Diff a stratified sample against upstream. Returns a summary dict."""
     rng = random.Random(seed if seed is not None else date.today().toordinal())
@@ -128,7 +144,13 @@ def reconcile(catalog, seed: Optional[int] = None) -> Dict:
     if not sample:
         return {"checked": 0, "problems": 0, "note": "empty sample"}
 
-    hi = date.today()
+    # Bound the window by what we have actually loaded, not by the wall clock.
+    # date.today() guaranteed a false alarm on every run before the 17:00 UTC
+    # collection: on 2026-08-10 the check reported "144 dates missing (upstream
+    # has them)" and agreement fell to 30/160, when in fact every one of those
+    # dates was today's not-yet-collected data. Comparing against a day we
+    # never claimed to have is not a defect signal.
+    hi = _latest_loaded_date(catalog) or date.today()
     lo = hi - timedelta(days=COMPARE_DAYS + 4)  # pad for weekends
     codes = {c for c, _, _ in sample}
 
