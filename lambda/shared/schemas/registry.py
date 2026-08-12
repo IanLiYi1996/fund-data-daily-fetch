@@ -51,6 +51,11 @@ _fund_daily_schema = Schema(
     NestedField(7, "subscription_status", StringType()),
     NestedField(8, "redemption_status", StringType()),
     NestedField(9, "fee", StringType()),
+    # Write time, used to break ties between duplicate (fund_code, trade_date)
+    # rows in the consumer export. Nullable: ~30M rows predate it and stay
+    # NULL, which orders LAST — so any row written from now on supersedes them,
+    # which is exactly the behaviour a correction needs.
+    NestedField(10, "ingested_at", TimestampType()),
     identifier_field_ids=[1, 3],
 )
 _fund_daily_partition = PartitionSpec(
@@ -84,6 +89,15 @@ _fund_dividend_partition = PartitionSpec(
 
 
 TABLES: dict[str, TableSpec] = {
+    # NOTE on ingested_at (field 10): fund_daily is append-mode, so the same
+    # (fund_code, trade_date) can legitimately carry more than one row — the
+    # fallback fetcher adds a value for a code the main snapshot missed, and a
+    # correction may supersede an earlier value. Consumers read the flat export,
+    # which picks one row per pair, and that pick used to order only by
+    # "non-null before null": between two non-null rows the winner was
+    # ARBITRARY. That made a correction unpublishable — you could write the
+    # right value and the export could keep the wrong one. ingested_at gives
+    # the tie a direction: newest write wins.
     "fund_daily": TableSpec(
         name="fund_daily",
         schema=_fund_daily_schema,

@@ -72,9 +72,23 @@ def compact_table(table) -> Dict[str, Any]:
     id_cols = _table_id_columns(table)
     if id_cols and rows_before > 0:
         df = arrow.to_pandas()
-        df = df.sort_values(id_cols, kind="mergesort").drop_duplicates(
-            subset=id_cols, keep="last"
-        )
+        # Which duplicate survives must be decided, not left to file order.
+        # Sorting on the identifier columns alone leaves rows with equal keys
+        # in whatever order they happened to be read, so keep="last" was
+        # arbitrary — compaction could discard a correction and retain the
+        # wrong value it replaced. Order by write time when the table has one,
+        # putting the newest last so keep="last" keeps it. NULLs (rows written
+        # before the column existed) sort first and thus lose, which is
+        # correct: anything written since is more authoritative.
+        sort_cols = list(id_cols)
+        if "ingested_at" in df.columns:
+            sort_cols.append("ingested_at")
+            df = df.sort_values(
+                sort_cols, kind="mergesort", na_position="first",
+            )
+        else:
+            df = df.sort_values(sort_cols, kind="mergesort")
+        df = df.drop_duplicates(subset=id_cols, keep="last")
         arrow = pa.Table.from_pandas(df, preserve_index=False).cast(
             table.schema().as_arrow()
         )
