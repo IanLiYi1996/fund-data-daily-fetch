@@ -82,12 +82,26 @@ MIN_FUNDS = int(os.environ.get("MIN_FUNDS", "20000"))
 MAX_EXPORT_LAG_HOURS = int(os.environ.get("MAX_EXPORT_LAG_HOURS", "30"))
 STATE_MACHINE_ARN = os.environ["STATE_MACHINE_ARN"]
 
-# Coverage is measured against the ACTIVE universe (fund_name minus known-dead
-# funds), because ~680 codes are delisted REITs, liquidated periodic-open
-# products, folded share classes and overseas-denominated QDII shares that
-# will never report again. Judging on a raw count instead hides regressions:
-# at a 20k floor, losing 500 live funds still passes.
-MIN_COVERAGE_PCT = float(os.environ.get("MIN_COVERAGE_PCT", "97.0"))
+# Coverage is measured against DAILY-CADENCE funds, not the whole active
+# universe. Judging on a raw count hides regressions (at a 20k floor, losing
+# 500 live funds still passes), but judging on every code ever seen produces
+# the opposite failure: ~1,700 weekly and hold-period products are absent on
+# any given day by design, which fired a 95.8% false alarm on 2026-08-11.
+#
+# 99% not 97%: on the cadence-scoped denominator the metric measured
+# 99.81-99.93% across 12 trading days (median 99.86%, no weekday effect), so
+# 99% leaves ~0.8pp ≈ 180 funds of headroom while catching a 200-fund
+# regression. Verified by injection: dropping 200 daily funds reads 98.9%.
+MIN_COVERAGE_PCT = float(os.environ.get("MIN_COVERAGE_PCT", "99.0"))
+# A fund counts as daily-cadence if it disclosed on at least this share of
+# recent trading days. 80% admits a fund that missed a couple of days while
+# excluding weekly publishers (measured at 20-60%).
+DAILY_CADENCE_MIN_PCT = float(os.environ.get("DAILY_CADENCE_MIN_PCT", "80"))
+# Calendar days of history to scan when classifying cadence.
+CADENCE_WINDOW_DAYS = int(os.environ.get("CADENCE_WINDOW_DAYS", "40"))
+# Below this many trading days of history, cadence can't be judged and the
+# coverage check abstains rather than guessing.
+_MIN_CADENCE_DAYS = 10
 # A code silent this long with nothing upstream is treated as inactive.
 INACTIVE_AFTER_DAYS = int(os.environ.get("INACTIVE_AFTER_DAYS", "30"))
 # Cap the per-run age-in probe so the check stays well inside its timeout.
@@ -143,16 +157,19 @@ def _check_fund_daily(problems: List[str], facts: List[str]) -> None:
     catalog = _catalog()
     tbl = catalog.load_table(("fund_data_lake", "fund_daily"))
 
-    # Only scan the recent window — a full scan is ~30M rows.
-    since = date.today() - timedelta(days=MAX_LAG_DAYS + 3)
+    # Scan a cadence-length window, not just the freshness window: the
+    # coverage check below has to know each fund's disclosure frequency, and
+    # that cannot be inferred from 7 days. Still far short of a full ~30M-row
+    # scan — 40 days is roughly 1M rows over three columns.
+    since = date.today() - timedelta(days=CADENCE_WINDOW_DAYS)
     arrow = tbl.scan(
         row_filter=GreaterThanOrEqual("trade_date", since),
-        selected_fields=("fund_code", "trade_date"),
+        selected_fields=("fund_code", "trade_date", "unit_nav"),
     ).to_arrow()
 
     if arrow.num_rows == 0:
         problems.append(
-            f"fund_daily 在最近 {MAX_LAG_DAYS + 3} 天内**没有任何数据**"
+            f"fund_daily 在最近 {CADENCE_WINDOW_DAYS} 天内**没有任何数据**"
         )
         return
 
@@ -190,9 +207,10 @@ _TRADING_DAY_MIN_FUNDS = 5000
 
 
 def _check_coverage(catalog, arrow, problems: List[str], facts: List[str]) -> None:
-    """Coverage on the most recent SETTLED trading day.
+    """Coverage on the most recent SETTLED trading day, scored only against
+    funds that actually disclose daily.
 
-    Two adjustments make this meaningful, both learned by measuring:
+    Three adjustments make this meaningful, all learned by measuring:
 
     - Score a trading day, not the newest row date. Weekends carry only
       money-market accrual (~800 of 26.7k codes), so scoring them reads as
@@ -201,15 +219,35 @@ def _check_coverage(catalog, arrow, problems: List[str], facts: List[str]) -> No
       funds disclose T+1, so on the newest day ~2.9k codes legitimately
       have nothing yet — measured at 89% on the newest day versus
       98.3-99.9% one day back.
+    - Score only DAILY-cadence funds. "Any code seen on an earlier trading
+      day" is the wrong denominator: plenty of bond funds and FOFs publish
+      weekly or on a hold-period schedule, so they are absent most days by
+      design. On 2026-08-11 this fired at 95.8% claiming "1,136 active funds
+      missing data" — of the 1,762 codes absent on the target day, 1,035
+      disclosed on 20-60% of trading days and 675 on under 20%, while only
+      **5** were genuinely daily-cadence. Upstream had no value for the
+      sampled ones either (0 of 8). The alert was unactionable by
+      construction: it asked ~1,700 funds to do something they never do.
+
+    Restricting the denominator to funds disclosing on at least
+    ``DAILY_CADENCE_MIN_PCT`` of recent trading days takes the same day from
+    95.8% to 99.9%, and the metric measured 99.81-99.93% across 12 trading
+    days with no weekday effect — a tight enough band to alarm at 99%, which
+    catches a ~200-fund regression. The old 97% floor on the noisy
+    denominator needed a 2,000-fund loss to fire.
     """
     universe, exempt = _active_universe(catalog)
     if not universe:
         return
 
+    # Presence means a usable NAV. A row with a null NAV is not coverage —
+    # that distinction is what the fallback fetcher keys on too.
     by_day: Dict[date, set] = {}
-    for code, day in zip(arrow["fund_code"].to_pylist(),
-                         arrow["trade_date"].to_pylist()):
-        by_day.setdefault(day, set()).add(code)
+    for code, day, nav in zip(arrow["fund_code"].to_pylist(),
+                              arrow["trade_date"].to_pylist(),
+                              arrow["unit_nav"].to_pylist()):
+        if nav is not None:
+            by_day.setdefault(day, set()).add(code)
 
     trading = sorted(d for d, s in by_day.items()
                      if len(s) >= _TRADING_DAY_MIN_FUNDS)
@@ -218,20 +256,36 @@ def _check_coverage(catalog, arrow, problems: List[str], facts: List[str]) -> No
         return
 
     target = trading[-2]  # newest is still mid-disclosure
-    baseline = set().union(*(by_day[d] for d in trading if d < target)) - exempt
-    if not baseline:
+    history = [d for d in trading if d < target]
+    if len(history) < _MIN_CADENCE_DAYS:
+        facts.append(
+            f"覆盖率: 交易日样本仅 {len(history)} 天，不足以判定披露频率，跳过"
+        )
         return
 
-    covered = by_day[target] & baseline
-    pct = 100.0 * len(covered) / len(baseline)
+    appearances: Dict[str, int] = {}
+    for d in history:
+        for code in by_day[d]:
+            appearances[code] = appearances.get(code, 0) + 1
+
+    threshold = DAILY_CADENCE_MIN_PCT / 100.0 * len(history)
+    daily = {
+        c for c, n in appearances.items()
+        if n >= threshold and c not in exempt
+    }
+    if not daily:
+        return
+
+    covered = by_day[target] & daily
+    pct = 100.0 * len(covered) / len(daily)
     facts.append(
-        f"覆盖率 {pct:.1f}% @ `{target}`（活跃 {len(baseline):,} = "
-        f"universe {len(universe):,} − 豁免 {len(exempt):,} − 未出现）"
+        f"覆盖率 {pct:.2f}% @ `{target}`（日频基金 {len(daily):,}，"
+        f"按近 {len(history)} 个交易日 ≥{DAILY_CADENCE_MIN_PCT:.0f}% 披露判定）"
     )
     if pct < MIN_COVERAGE_PCT:
         problems.append(
-            f"`{target}` 覆盖率 {pct:.1f}% 低于阈值 {MIN_COVERAGE_PCT}% — "
-            f"{len(baseline) - len(covered):,} 只活跃基金缺数据"
+            f"`{target}` 日频基金覆盖率 {pct:.2f}% 低于阈值 {MIN_COVERAGE_PCT}% — "
+            f"{len(daily) - len(covered):,} 只日频基金缺数据"
         )
 
 
