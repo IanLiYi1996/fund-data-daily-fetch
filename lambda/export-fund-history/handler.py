@@ -120,6 +120,23 @@ def _export_month(ym: str, tmp: Path) -> Dict[str, Any]:
         return {"month": ym, "rows": 0, "bytes": 0, "skipped": "no-live-files"}
 
     t0 = time.time()
+    # union_by_name is required, not cosmetic: ingested_at was added to the
+    # schema after ~30M rows already existed, so older data files do not carry
+    # the column. Without it DuckDB rejects the mixed file set.
+    source = f"read_parquet({live!r}, union_by_name=true)"
+    # ...and union_by_name can only surface a column that at least one file in
+    # THIS month has. Referencing it unconditionally is a hard BinderException
+    # that takes the whole export down, which is what happened on the first
+    # deploy: the schema had evolved but no data file carried the column yet.
+    # So probe, then order accordingly — self-healing as files gain it.
+    available = {
+        r[0] for r in con.sql(f"DESCRIBE SELECT * FROM {source} LIMIT 0").fetchall()
+    }
+    # Newest write wins. Without this the order between two NON-null rows was
+    # ARBITRARY, so a corrected value could lose to the wrong one it was meant
+    # to replace and the fix would never reach the consumer. Rows predating the
+    # column are NULL and sort last, making any new write authoritative.
+    recency = ", ingested_at DESC NULLS LAST" if "ingested_at" in available else ""
     con.sql(f"""
         COPY (
             WITH ranked AS (
@@ -128,8 +145,9 @@ def _export_month(ym: str, tmp: Path) -> Dict[str, Any]:
                            PARTITION BY fund_code, trade_date
                            ORDER BY CASE WHEN unit_nav IS NOT NULL THEN 0 ELSE 1 END,
                                     CASE WHEN accum_nav IS NOT NULL THEN 0 ELSE 1 END
+                                    {recency}
                        ) AS rn
-                FROM read_parquet({live!r})
+                FROM {source}
             )
             SELECT fund_code, fund_name, trade_date, unit_nav, accum_nav,
                    daily_return_pct, subscription_status, redemption_status, fee

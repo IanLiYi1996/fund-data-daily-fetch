@@ -435,6 +435,17 @@ class IcebergWriter:
                     col = col.astype(str).str.rstrip("%")
                 projected[field.name] = pd.to_numeric(col, errors="coerce")
 
+        # 4c-pre. Stamp the write time when the target schema asks for one.
+        # This is what lets the consumer export break ties between duplicate
+        # rows deterministically (newest wins) instead of arbitrarily, so a
+        # corrected value can actually supersede a wrong one. Set before the
+        # padding below, which would otherwise fill it with None.
+        if any(f.name == "ingested_at" for f in spec.schema.fields):
+            if "ingested_at" not in projected.columns:
+                # tz-naive UTC: the Iceberg column is `timestamp` (without
+                # zone), and casting a tz-aware value to it raises.
+                projected["ingested_at"] = pd.Timestamp.now("UTC").tz_localize(None)
+
         # 4c. Pad missing (nullable) schema columns with None so the Arrow
         # table always has EXACTLY the target schema's field set in the same
         # order. pyiceberg.upsert() calls source_table.cast(target_schema)
