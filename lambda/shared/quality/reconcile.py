@@ -22,7 +22,9 @@ from __future__ import annotations
 import json
 import os
 import random
+import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +42,17 @@ SAMPLE_SIZE = int(os.environ.get("RECONCILE_SAMPLE_SIZE", "60"))
 COMPARE_DAYS = int(os.environ.get("RECONCILE_COMPARE_DAYS", "5"))
 # NAVs are published to 4 decimals; larger gaps are real disagreements.
 NAV_TOLERANCE = float(os.environ.get("RECONCILE_NAV_TOLERANCE", "0.0001"))
+# Concurrency for upstream probes. Modest on purpose — this is a sampled
+# check, not a bulk fetch, and 天天基金 rate-limits volume. Sized so that a
+# round in which EVERY probe times out still fits the budget below:
+# 162 samples x 8s / 12 workers = 108s < 150s.
+RECONCILE_WORKERS = int(os.environ.get("RECONCILE_WORKERS", "12"))
+# Per-probe socket timeout. 20s made a single unreachable upstream cost 20s
+# of the budget; 8s still clears a healthy p95 (measured ~2s).
+PROBE_TIMEOUT = float(os.environ.get("RECONCILE_PROBE_TIMEOUT", "8"))
+# Wall-clock budget. The check itself gets 600s and its scans need ~300s, so
+# reconciliation must not be able to consume the remainder.
+RECONCILE_BUDGET_SECONDS = float(os.environ.get("RECONCILE_BUDGET_SECONDS", "150"))
 
 _HEADERS = {
     "Referer": "https://fundf10.eastmoney.com/",
@@ -83,7 +96,7 @@ def _upstream(code: str, lo: date, hi: date) -> Optional[Dict[date, float]]:
            f"&pageIndex=1&pageSize=40&startDate={lo}&endDate={hi}")
     try:
         req = urllib.request.Request(url, headers=_HEADERS)
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT) as r:
             rows = json.loads(r.read()).get("Data", {}).get("LSJZList") or []
     except Exception as e:
         logger.warning(f"{code}: upstream error {type(e).__name__}")
@@ -197,8 +210,44 @@ def reconcile(catalog, seed: Optional[int] = None) -> Dict:
     diffs: List[str] = []
     checked = probe_errors = passed = 0
 
+    # Probe concurrently, under a wall-clock budget.
+    #
+    # These were sequential, and each failure costs a full connect timeout: on
+    # 2026-08-21 upstream went unreachable and the probes failed ~15.4s apart,
+    # so 162 samples would have needed ~2,430s. The check has a 600s ceiling
+    # and hit it twice — and a timed-out check posts NOTHING, which is strictly
+    # worse than a partial one, because the whole point of the daily heartbeat
+    # is that silence means the monitor itself died.
+    #
+    # A partial result is honest: `checked` and `probe_errors` are already
+    # reported, so a short round shows up as a smaller denominator rather than
+    # as a false clean bill of health.
+    deadline = time.monotonic() + RECONCILE_BUDGET_SECONDS
+    fetched: Dict[str, Optional[Dict[date, float]]] = {}
+    with ThreadPoolExecutor(max_workers=RECONCILE_WORKERS) as ex:
+        futs = {
+            ex.submit(_upstream, code, lo, hi): code
+            for code, _n, _s in sample
+        }
+        for fut in as_completed(futs):
+            code = futs[fut]
+            try:
+                fetched[code] = fut.result()
+            except Exception:
+                fetched[code] = None
+            if time.monotonic() > deadline:
+                logger.warning(
+                    f"reconcile budget exhausted after {len(fetched)} of "
+                    f"{len(sample)} probes; reporting partial result"
+                )
+                for f in futs:
+                    f.cancel()
+                break
+
     for code, _name, _stratum in sample:
-        up = _upstream(code, lo, hi)
+        if code not in fetched:
+            continue  # cancelled by the budget; not counted either way
+        up = fetched[code]
         if up is None:
             probe_errors += 1
             continue
