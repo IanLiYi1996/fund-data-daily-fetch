@@ -980,7 +980,13 @@ export class FundDataFetchStack extends Stack {
       // leaves no room for the table to grow. Aggregation is already done in
       // Arrow rather than pandas; the scans still have to materialize.
       4096,
-      10,
+      // 15 min, up from 10. The scans alone measure ~300-320s, and on
+      // 2026-08-21 an unreachable upstream made reconciliation consume the
+      // rest and hit the ceiling TWICE — a timed-out check posts nothing,
+      // which is the one outcome the daily heartbeat is designed to rule out
+      // (silence is supposed to mean the monitor died). Reconciliation now has
+      // its own 150s budget, so this headroom is belt-and-braces.
+      15,
       {
         ...lambdaEnv,
         SLACK_WEBHOOK_SECRET_ARN: slackWebhookSecret.secretArn,
