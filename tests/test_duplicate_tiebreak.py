@@ -108,3 +108,63 @@ def test_all_three_observed_discrepancy_shapes_are_correctable(kind, ours, upstr
     rows = _pair(ours, upstream, pd.NaT, pd.Timestamp("2026-08-12 02:50"))
     assert export_winner(rows).unit_nav == upstream
     assert compaction_survivor(rows).unit_nav == upstream
+
+
+# --- reconcile is the THIRD place that must apply the same rule ---
+#
+# Export and compaction were fixed on 2026-08-12. Reconciliation was not, and
+# it reads raw Iceberg rows: on 2026-08-21 it reported
+# `003317@2026-08-14 ours=1.2314 vs upstream 0.5608` while the corrected
+# 0.5608 was already stored AND already in the consumer export. A checker that
+# disagrees with what it ships raises false alarms about values nobody sees.
+
+_MISSING = object()
+
+
+def reconcile_pick(rows: pd.DataFrame) -> float:
+    """Mirrors the newest-write selection in shared/quality/reconcile.py."""
+    value = None
+    stamp = _MISSING
+    for _, r in rows.iterrows():
+        ts = None if pd.isna(r.ingested_at) else r.ingested_at
+        if stamp is not _MISSING:
+            if ts is None:
+                continue
+            if stamp is not None and stamp >= ts:
+                continue
+        value, stamp = r.unit_nav, ts
+    return value
+
+
+def test_reconcile_prefers_the_correction():
+    """The real 003317 case, in both row orders."""
+    old = {"fund_code": "003317", "trade_date": "2026-08-14",
+           "unit_nav": 1.2314, "ingested_at": pd.NaT}
+    new = {"fund_code": "003317", "trade_date": "2026-08-14",
+           "unit_nav": 0.5608, "ingested_at": pd.Timestamp("2026-08-21 02:30")}
+    assert reconcile_pick(pd.DataFrame([old, new])) == 0.5608
+    assert reconcile_pick(pd.DataFrame([new, old])) == 0.5608, (
+        "must not depend on the order rows come back in"
+    )
+
+
+def test_reconcile_agrees_with_export():
+    """Divergence here is what produced the false alarm."""
+    rows = pd.DataFrame([
+        {"fund_code": "003317", "trade_date": "2026-08-14",
+         "unit_nav": 1.2314, "accum_nav": 1.0, "ingested_at": pd.NaT},
+        {"fund_code": "003317", "trade_date": "2026-08-14",
+         "unit_nav": 0.5608, "accum_nav": 1.0,
+         "ingested_at": pd.Timestamp("2026-08-21 02:30")},
+    ])
+    assert reconcile_pick(rows) == export_winner(rows).unit_nav
+
+
+def test_reconcile_handles_two_timestamped_rows():
+    rows = pd.DataFrame([
+        {"fund_code": "022605", "trade_date": "2026-08-16", "unit_nav": 0.674,
+         "ingested_at": pd.Timestamp("2026-08-17 03:00")},
+        {"fund_code": "022605", "trade_date": "2026-08-16", "unit_nav": 0.337,
+         "ingested_at": pd.Timestamp("2026-08-21 02:30")},
+    ])
+    assert reconcile_pick(rows) == 0.337

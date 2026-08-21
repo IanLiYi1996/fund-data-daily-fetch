@@ -28,7 +28,8 @@ lambda/freshness-check/handler.py.
 import pytest
 
 MIN_COVERAGE_PCT = 99.0
-DAILY_CADENCE_MIN_PCT = 80.0
+# Raised from 80% on 2026-08-21 — see test_cadence_bar_must_exclude_four_in_five.
+DAILY_CADENCE_MIN_PCT = 90.0
 
 # Measured 2026-08-11 on the settled target day 2026-08-10.
 DAILY_POPULATION = 21_540
@@ -69,8 +70,9 @@ def test_old_denominator_would_still_have_alarmed():
 
 @pytest.mark.parametrize("days_seen,expected", [
     (26, True),    # every day
-    (21, True),    # 80.8% — missed a week's worth, still daily
-    (20, False),   # 76.9%
+    (24, True),    # 92.3%
+    (23, False),   # 88.5% — below the 90% bar
+    (21, False),   # 80.8%: admitted under the old bar, and that was the bug
     (13, False),   # weekly publisher: measured 20-60% band
     (5, False),    # low frequency / stopped
 ])
@@ -85,6 +87,29 @@ def test_weekly_publishers_are_excluded_from_scoring():
     """
     # ~1 day in 5 over 26 trading days
     assert not is_daily_cadence(5, trading_days=26)
+
+
+def test_cadence_bar_must_exclude_four_in_five():
+    """Why the bar moved 80% -> 90% (2026-08-21 alert).
+
+    80% excluded weekly publishers but still admitted FOFs publishing ~4 days
+    in 5. That made the DENOMINATOR itself unstable: as the window slid past a
+    low-coverage stretch, ~4,150 of them crossed the bar at once (21,580 ->
+    25,737 between 08-14 and 08-17), invalidating a threshold calibrated
+    against the smaller population. The check then fired at 96.34%, and of the
+    941 funds it named, 931 sat in the 80-85% band, 927 were FOF, and upstream
+    had no value for 20 of 20 sampled.
+
+    Measured denominator span over 15 trading days:
+        80% -> 4,250    85% -> 3,325    90% -> 103    95% -> 134
+    """
+    four_in_five = 21  # 80.8% of 26 trading days
+    assert not is_daily_cadence(four_in_five, trading_days=26), (
+        "a fund skipping one day in five is not daily-cadence"
+    )
+    # And the bar must not creep so high that a fund missing a single day is
+    # dropped — that would shrink the denominator until nothing is checked.
+    assert is_daily_cadence(25, trading_days=26)
 
 
 # --- sensitivity: the check must still catch real regressions ---
