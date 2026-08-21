@@ -24,13 +24,16 @@ import os
 import random
 import urllib.request
 from datetime import date, timedelta
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pyiceberg.expressions import GreaterThanOrEqual
 
 from shared.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Distinguishes "no row seen yet" from "row seen with a NULL stamp".
+_MISSING = object()
 
 DATABASE = "fund_data_lake"
 SAMPLE_SIZE = int(os.environ.get("RECONCILE_SAMPLE_SIZE", "60"))
@@ -158,14 +161,36 @@ def reconcile(catalog, seed: Optional[int] = None) -> Dict:
     # very defect it exists to detect.
     arrow = catalog.load_table((DATABASE, "fund_daily")).scan(
         row_filter=GreaterThanOrEqual("trade_date", lo),
-        selected_fields=("fund_code", "trade_date", "unit_nav"),
+        selected_fields=("fund_code", "trade_date", "unit_nav", "ingested_at"),
     ).to_arrow()
+    # fund_daily is append-mode, so a (code, date) can hold several rows and a
+    # correction sits alongside the value it replaced. Take the newest write —
+    # the same rule the export and weekly compaction use. Reading raw rows and
+    # keeping whichever came last reported `003317@2026-08-14` as ours=1.2314
+    # against upstream 0.5608 when the corrected 0.5608 was already there and
+    # already exported: a false alarm about a value the consumer never sees.
     mine: Dict[str, Dict[date, float]] = {}
-    for c, d, v in zip(arrow["fund_code"].to_pylist(),
-                       arrow["trade_date"].to_pylist(),
-                       arrow["unit_nav"].to_pylist()):
-        if c in codes and v is not None:
-            mine.setdefault(c, {})[d] = v
+    stamps: Dict[str, Dict[date, Any]] = {}
+    ingested = (
+        arrow["ingested_at"].to_pylist()
+        if "ingested_at" in arrow.column_names
+        else [None] * arrow.num_rows
+    )
+    for c, d, v, ts in zip(arrow["fund_code"].to_pylist(),
+                           arrow["trade_date"].to_pylist(),
+                           arrow["unit_nav"].to_pylist(),
+                           ingested):
+        if c not in codes or v is None:
+            continue
+        prev_ts = stamps.get(c, {}).get(d, _MISSING)
+        if prev_ts is not _MISSING:
+            # Keep the newer stamp; a NULL stamp predates the column and loses.
+            if ts is None:
+                continue
+            if prev_ts is not None and prev_ts >= ts:
+                continue
+        mine.setdefault(c, {})[d] = v
+        stamps.setdefault(c, {})[d] = ts
 
     extra: List[str] = []
     missing: List[str] = []

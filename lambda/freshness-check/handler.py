@@ -94,9 +94,30 @@ STATE_MACHINE_ARN = os.environ["STATE_MACHINE_ARN"]
 # regression. Verified by injection: dropping 200 daily funds reads 98.9%.
 MIN_COVERAGE_PCT = float(os.environ.get("MIN_COVERAGE_PCT", "99.0"))
 # A fund counts as daily-cadence if it disclosed on at least this share of
-# recent trading days. 80% admits a fund that missed a couple of days while
-# excluding weekly publishers (measured at 20-60%).
-DAILY_CADENCE_MIN_PCT = float(os.environ.get("DAILY_CADENCE_MIN_PCT", "80"))
+# recent trading days.
+#
+# 90%, not the 80% first shipped. 80% excluded weekly publishers (20-60%) but
+# still admitted FOFs that publish roughly 4 days in 5, and those made the
+# denominator itself unstable: as the window slid past a low-coverage stretch,
+# ~4,150 of them crossed the bar at once (21,580 -> 25,737 between 2026-08-14
+# and 08-17), which invalidated the threshold calibrated against the smaller
+# population and fired at 96.34% on 08-19. Of the 941 funds reported missing
+# that day, 931 sat in the 80-85% band and 927 were FOF, and upstream had no
+# value for 20 of 20 sampled — again a metric asking funds to do something they
+# never do.
+#
+# 90% is where the instability collapses, measured over 15 trading days:
+#
+#     cadence bar   denominator span   coverage min
+#          80%           4,250            93.50%
+#          85%           3,325            97.01%
+#          90%             103            99.93%
+#          95%             134            99.95%
+#
+# The knee is sharp because the genuinely-daily population really is ~21.4k;
+# everything between 80% and 90% is hold-period products. Anything >=90% gives
+# the same answer, so 90% is chosen as the loosest stable setting.
+DAILY_CADENCE_MIN_PCT = float(os.environ.get("DAILY_CADENCE_MIN_PCT", "90"))
 # Calendar days of history to scan when classifying cadence.
 CADENCE_WINDOW_DAYS = int(os.environ.get("CADENCE_WINDOW_DAYS", "40"))
 # Below this many trading days of history, cadence can't be judged and the

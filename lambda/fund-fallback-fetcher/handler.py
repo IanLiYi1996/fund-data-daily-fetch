@@ -52,6 +52,13 @@ _HEADERS = {
 # leaves the day partially filled with no error surfaced anywhere.
 FALLBACK_WORKERS = int(os.environ.get("FALLBACK_WORKERS", "24"))
 
+# 每万份收益 is quoted to 4 decimals, so anything past rounding is a real
+# disagreement. Set above 1e-4 to avoid rewriting rows over the last digit.
+MONEY_NAV_TOLERANCE = float(os.environ.get("MONEY_NAV_TOLERANCE", "0.0005"))
+# The money-fund verification pass costs ~977 requests; skip it via env when
+# debugging a slow run rather than editing code.
+VERIFY_MONEY_FUNDS = os.environ.get("VERIFY_MONEY_FUNDS", "1") != "0"
+
 
 def _fetch_one(code_name, start_date: str, end_date: str):
     code, name = code_name
@@ -170,6 +177,88 @@ def _existing_pairs(catalog, start_date: date, end_date: date) -> set:
     }
 
 
+def _verify_money_funds(
+    catalog, target: date, writer: "IcebergWriter",
+) -> Dict[str, Any]:
+    """Re-assert money-market NAVs from lsjz, writing only where we disagree.
+
+    The daily snapshot endpoint reports 每万份收益 for some money funds as an
+    accrual covering everything since their last publication, not for the one
+    day the row is labelled with. Written as-is that overstates a single day:
+    measured 2026-08-14..08-20, 13 of 6,303 money-fund rows disagreed with the
+    history endpoint — 2x on a Sunday (`022605` 0.674 vs 0.337), 3x on a Friday
+    (`000331` 0.739 vs 0.2468), and some non-integer ratios.
+
+    An earlier pass corrected 11 such rows by hand. That treated the symptom:
+    nothing in the write path changed, so it recurred the following weekend.
+    This is the cause fix — lsjz is the source of record (it publishes one row
+    per day, including Saturday and Sunday), so its value wins.
+
+    Only ~977 codes are money-market, so re-checking all of them costs about a
+    thousand requests. Rows are written ONLY where the values differ, which
+    keeps the daily volume at a handful rather than ~977 duplicates; the
+    ingested_at tiebreak then makes the new row authoritative in both the export
+    and weekly compaction, so no delete is required.
+    """
+    name_tbl = catalog.load_table((DATABASE, "fund_name"))
+    fn = name_tbl.scan().to_arrow().to_pandas()
+    fn = fn[fn.snapshot_date == fn.snapshot_date.max()].drop_duplicates("fund_code")
+    if "fund_type" not in fn.columns:
+        return {"checked": 0, "corrected": 0}
+    money = fn[fn.fund_type.fillna("").str.startswith("货币型")]
+    if money.empty:
+        return {"checked": 0, "corrected": 0}
+
+    held = catalog.load_table((DATABASE, "fund_daily")).scan(
+        row_filter=And(
+            GreaterThanOrEqual("trade_date", target),
+            LessThanOrEqual("trade_date", target),
+        ),
+        selected_fields=("fund_code", "trade_date", "unit_nav"),
+    ).to_arrow().to_pandas()
+    held = held[held.unit_nav.notna()]
+    if held.empty:
+        return {"checked": 0, "corrected": 0}
+    ours = dict(zip(held.fund_code, held.unit_nav))
+
+    items = [
+        (c, n) for c, n in zip(money.fund_code, money.fund_name) if c in ours
+    ]
+    frames: list[pd.DataFrame] = []
+    with ThreadPoolExecutor(max_workers=FALLBACK_WORKERS) as ex:
+        futs = {
+            ex.submit(_fetch_one, it, target.isoformat(), target.isoformat()): it
+            for it in items
+        }
+        for fut in as_completed(futs):
+            code, df, _err = fut.result()
+            if df is None or df.empty:
+                continue
+            row = df[df.trade_date == target]
+            if row.empty:
+                continue
+            upstream = row.unit_nav.iloc[0]
+            if upstream is None or pd.isna(upstream):
+                continue
+            if abs(float(upstream) - float(ours[code])) > MONEY_NAV_TOLERANCE:
+                frames.append(row)
+
+    if not frames:
+        return {"checked": len(items), "corrected": 0}
+
+    merged = pd.concat(frames, ignore_index=True)
+    writer.write("fund_daily", merged, fetch_date=target)
+    logger.info(
+        f"money verify: corrected {len(merged)} of {len(items)} on {target}: "
+        + ", ".join(merged.fund_code.head(10))
+    )
+    return {
+        "checked": len(items),
+        "corrected": int(len(merged)),
+        "codes": merged.fund_code.head(20).tolist(),
+    }
+
+
 def _latest_loaded_date(catalog) -> Optional[date]:
     """Newest trade_date present in fund_daily.
 
@@ -216,6 +305,22 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         f"fetch window {start_date.isoformat()} → {end_date.isoformat()}"
     )
 
+    writer = IcebergWriter(
+        database=DATABASE, warehouse=WAREHOUSE, subprocess_mode=False,
+    )
+
+    # Runs before the gap fill and on every exit path: a day can have no gaps
+    # at all and still hold a wrong money-market value, because that defect is
+    # about the VALUE the snapshot endpoint reported, not about a missing row.
+    # Best-effort — a failure here must not cost the gap fill.
+    money: Dict[str, Any] = {"checked": 0, "corrected": 0}
+    if VERIFY_MONEY_FUNDS:
+        try:
+            money = _verify_money_funds(catalog, end_date, writer)
+        except Exception as e:
+            logger.warning(f"money verify failed: {type(e).__name__}: {e}")
+            money = {"checked": 0, "corrected": 0, "error": f"{type(e).__name__}"}
+
     missing = _get_missing_universe(catalog, end_date, start_date)
     logger.info(f"Missing funds in window: {len(missing):,}")
 
@@ -227,6 +332,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "missing": 0,
             "fetched": 0,
             "rows_appended": 0,
+            "money_verify": money,
             "elapsed_seconds": (datetime.utcnow() - started).total_seconds(),
         }
 
@@ -260,6 +366,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "missing": len(missing),
             "fetched": 0,
             "rows_appended": 0,
+            "money_verify": money,
             "elapsed_seconds": (datetime.utcnow() - started).total_seconds(),
         }
 
@@ -294,12 +401,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "missing": len(missing),
             "fetched": 0,
             "rows_appended": 0,
+            "money_verify": money,
             "elapsed_seconds": (datetime.utcnow() - started).total_seconds(),
         }
 
-    writer = IcebergWriter(
-        database=DATABASE, warehouse=WAREHOUSE, subprocess_mode=False,
-    )
     result = writer.write("fund_daily", merged, fetch_date=end_date)
 
     return {
@@ -311,5 +416,6 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         "rows_appended": int(result.get("rows_appended", result.get("rows_inserted", 0))),
         "empty": empty,
         "errors": err,
+        "money_verify": money,
         "elapsed_seconds": (datetime.utcnow() - started).total_seconds(),
     }
