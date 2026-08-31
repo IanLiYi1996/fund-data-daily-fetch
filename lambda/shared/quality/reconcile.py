@@ -40,8 +40,17 @@ _MISSING = object()
 DATABASE = "fund_data_lake"
 SAMPLE_SIZE = int(os.environ.get("RECONCILE_SAMPLE_SIZE", "60"))
 COMPARE_DAYS = int(os.environ.get("RECONCILE_COMPARE_DAYS", "5"))
-# NAVs are published to 4 decimals; larger gaps are real disagreements.
-NAV_TOLERANCE = float(os.environ.get("RECONCILE_NAV_TOLERANCE", "0.0001"))
+# NAVs are published to 4 decimals, so a disagreement has to exceed one quote
+# unit to mean anything. 0.0001 was the wrong boundary in binary floating
+# point: 0.4197 - 0.4196 evaluates to 0.0001000000000000445, which is strictly
+# greater, so a difference of exactly ONE unit in the last place fired an alert
+# (019635@2026-08-23, 2026-08-31). Measured over 1,444 (code, date) pairs
+# across a 300-fund sample, ALL matched exactly — one-unit disagreements are
+# rare noise from an upstream revision or a rounding path, not a defect, and a
+# red alert for one costs more than it reveals. Sits half a unit above 1e-4 so
+# two-unit gaps still fire; the defects worth catching (2x/3x values, wrong
+# dates) are orders of magnitude away.
+NAV_TOLERANCE = float(os.environ.get("RECONCILE_NAV_TOLERANCE", "0.00015"))
 # Concurrency for upstream probes. Modest on purpose — this is a sampled
 # check, not a bulk fetch, and 天天基金 rate-limits volume. Sized so that a
 # round in which EVERY probe times out still fits the budget below:

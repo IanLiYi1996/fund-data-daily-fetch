@@ -104,3 +104,42 @@ def test_correction_relies_on_ingested_at_not_deletion():
          "accum_nav": 1.238, "ingested_at": pd.Timestamp("2026-08-21 02:00")},
     ])
     assert export_winner(rows).unit_nav == 0.337
+
+
+# --- reconcile's boundary must survive binary floating point ---
+
+RECONCILE_NAV_TOLERANCE = 0.00015
+
+
+def reconcile_flags(ours: float, upstream: float) -> bool:
+    return abs(ours - upstream) > RECONCILE_NAV_TOLERANCE
+
+
+def test_one_quote_unit_does_not_alarm():
+    """019635@2026-08-23 fired on a 0.0001 difference.
+
+    NAVs are published to 4 decimals, so one unit in the last place is the
+    smallest representable disagreement, and 1,444 of 1,444 sampled
+    (code, date) pairs matched exactly — a single one-unit gap is noise.
+    """
+    assert not reconcile_flags(0.4196, 0.4197)
+
+
+def test_the_old_boundary_fired_on_it_because_of_float_representation():
+    """Pins the actual cause, not just the symptom."""
+    assert 0.4197 - 0.4196 > 0.0001, "the subtraction really does exceed 1e-4"
+    assert not reconcile_flags(0.4196, 0.4197), "but the new boundary absorbs it"
+
+
+def test_two_quote_units_still_alarm():
+    assert reconcile_flags(0.4196, 0.4198)
+
+
+@pytest.mark.parametrize("ours,upstream", [
+    (0.674, 0.337),      # 2x
+    (0.739, 0.2468),     # 3x
+    (1.2314, 0.5608),    # ~2.2x
+])
+def test_real_defects_are_far_from_the_boundary(ours, upstream):
+    assert abs(ours - upstream) > RECONCILE_NAV_TOLERANCE * 100
+    assert reconcile_flags(ours, upstream)
