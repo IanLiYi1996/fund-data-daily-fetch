@@ -58,6 +58,10 @@ MONEY_NAV_TOLERANCE = float(os.environ.get("MONEY_NAV_TOLERANCE", "0.0005"))
 # The money-fund verification pass costs ~977 requests; skip it via env when
 # debugging a slow run rather than editing code.
 VERIFY_MONEY_FUNDS = os.environ.get("VERIFY_MONEY_FUNDS", "1") != "0"
+# How far back the money check re-verifies. Must exceed 1 day: the snapshot
+# endpoint rewrites YESTERDAY too, so a target-day-only check gets undone by
+# the next night's run. 5 covers a weekend plus a day either side.
+MONEY_VERIFY_LOOKBACK_DAYS = int(os.environ.get("MONEY_VERIFY_LOOKBACK_DAYS", "5"))
 
 
 def _fetch_one(code_name, start_date: str, end_date: str):
@@ -209,39 +213,68 @@ def _verify_money_funds(
     if money.empty:
         return {"checked": 0, "corrected": 0}
 
+    # Check a WINDOW, not just the target day. The snapshot endpoint returns
+    # today AND yesterday, so the run on day D rewrites day D-1 — and it
+    # rewrites it with the same cumulative figure. A target-day-only check
+    # therefore verifies D, then the next night's run silently re-breaks D and
+    # nothing looks at it again: 004904@2026-08-23 held a single row stamped
+    # 2026-08-24 17:16, written by the following day's collection, and the
+    # 2026-08-21 fix never saw it. Because the correction wins on ingested_at,
+    # a LATER bad write also beats an EARLIER correction, so re-checking the
+    # window is what makes the fix durable rather than momentary.
+    #
+    # lsjz accepts a date range, so the whole window still costs one request
+    # per fund.
+    window_start = target - timedelta(days=MONEY_VERIFY_LOOKBACK_DAYS)
     held = catalog.load_table((DATABASE, "fund_daily")).scan(
         row_filter=And(
-            GreaterThanOrEqual("trade_date", target),
+            GreaterThanOrEqual("trade_date", window_start),
             LessThanOrEqual("trade_date", target),
         ),
-        selected_fields=("fund_code", "trade_date", "unit_nav"),
+        selected_fields=("fund_code", "trade_date", "unit_nav", "ingested_at"),
     ).to_arrow().to_pandas()
     held = held[held.unit_nav.notna()]
     if held.empty:
         return {"checked": 0, "corrected": 0}
-    ours = dict(zip(held.fund_code, held.unit_nav))
+    # Compare against the row the consumer actually gets — newest write per
+    # (code, date) — or a stale duplicate would look like a live discrepancy
+    # and get "corrected" on every single run.
+    held = held.sort_values("ingested_at", na_position="first")
+    ours = {
+        (r.fund_code, r.trade_date): r.unit_nav
+        for _, r in held.iterrows()
+    }
 
+    money_codes = set(money.fund_code)
     items = [
-        (c, n) for c, n in zip(money.fund_code, money.fund_name) if c in ours
+        (c, n) for c, n in zip(money.fund_code, money.fund_name)
+        if c in money_codes
     ]
     frames: list[pd.DataFrame] = []
     with ThreadPoolExecutor(max_workers=FALLBACK_WORKERS) as ex:
         futs = {
-            ex.submit(_fetch_one, it, target.isoformat(), target.isoformat()): it
+            ex.submit(
+                _fetch_one, it, window_start.isoformat(), target.isoformat(),
+            ): it
             for it in items
         }
         for fut in as_completed(futs):
             code, df, _err = fut.result()
             if df is None or df.empty:
                 continue
-            row = df[df.trade_date == target]
-            if row.empty:
-                continue
-            upstream = row.unit_nav.iloc[0]
-            if upstream is None or pd.isna(upstream):
-                continue
-            if abs(float(upstream) - float(ours[code])) > MONEY_NAV_TOLERANCE:
-                frames.append(row)
+            bad = df[df.apply(
+                lambda r: (
+                    (code, r.trade_date) in ours
+                    and r.unit_nav is not None
+                    and not pd.isna(r.unit_nav)
+                    and abs(float(r.unit_nav)
+                            - float(ours[(code, r.trade_date)]))
+                    > MONEY_NAV_TOLERANCE
+                ),
+                axis=1,
+            )] if not df.empty else df
+            if not bad.empty:
+                frames.append(bad)
 
     if not frames:
         return {"checked": len(items), "corrected": 0}
@@ -249,13 +282,17 @@ def _verify_money_funds(
     merged = pd.concat(frames, ignore_index=True)
     writer.write("fund_daily", merged, fetch_date=target)
     logger.info(
-        f"money verify: corrected {len(merged)} of {len(items)} on {target}: "
-        + ", ".join(merged.fund_code.head(10))
+        f"money verify: corrected {len(merged)} rows over "
+        f"{window_start}..{target} across {len(items)} funds: "
+        + ", ".join(f"{r.fund_code}@{r.trade_date}"
+                    for _, r in merged.head(10).iterrows())
     )
     return {
         "checked": len(items),
+        "window": f"{window_start}..{target}",
         "corrected": int(len(merged)),
-        "codes": merged.fund_code.head(20).tolist(),
+        "codes": [f"{r.fund_code}@{r.trade_date}"
+                  for _, r in merged.head(20).iterrows()],
     }
 
 

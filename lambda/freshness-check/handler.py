@@ -120,6 +120,12 @@ MIN_COVERAGE_PCT = float(os.environ.get("MIN_COVERAGE_PCT", "99.0"))
 DAILY_CADENCE_MIN_PCT = float(os.environ.get("DAILY_CADENCE_MIN_PCT", "90"))
 # Calendar days of history to scan when classifying cadence.
 CADENCE_WINDOW_DAYS = int(os.environ.get("CADENCE_WINDOW_DAYS", "40"))
+# Categories whose NAV settles a day later than the rest, so scoring them on
+# the same day as everything else reports a phantom gap. FOF price off their
+# holdings' NAVs, so they publish one trading day behind — measured at 19.1%
+# on the first settled day versus 99.8% on the second.
+_SLOW_SETTLE_CATEGORIES = {"FOF"}
+_SLOW_SETTLE_LAG = int(os.environ.get("SLOW_SETTLE_LAG", "2"))
 # Below this many trading days of history, cadence can't be judged and the
 # coverage check abstains rather than guessing.
 _MIN_CADENCE_DAYS = 10
@@ -152,6 +158,25 @@ def _catalog():
     return load_catalog("glue", **{
         "type": "glue", "glue.region": REGION, "warehouse": WAREHOUSE,
     })
+
+
+def _fund_categories(catalog) -> Dict[str, str]:
+    """fund_code -> top-level category from fund_name.fund_type.
+
+    Keyed on fund_type, never on name keywords: matching names misfires badly
+    ("现金" hits an equity ETF, "增利" hits a bond fund), which once mislabelled
+    252 funds as money-market.
+    """
+    fn = catalog.load_table(("fund_data_lake", "fund_name")).scan(
+        selected_fields=("fund_code", "fund_type", "snapshot_date"),
+    ).to_arrow().to_pandas()
+    if fn.empty:
+        return {}
+    fn = fn[fn.snapshot_date == fn.snapshot_date.max()].drop_duplicates("fund_code")
+    return {
+        c: (t or "").split("-")[0]
+        for c, t in zip(fn.fund_code, fn.fund_type)
+    }
 
 
 def _active_universe(catalog) -> tuple[set, set]:
@@ -278,6 +303,7 @@ def _check_coverage(catalog, arrow, problems: List[str], facts: List[str]) -> No
 
     target = trading[-2]  # newest is still mid-disclosure
     history = [d for d in trading if d < target]
+    categories = _fund_categories(catalog)
     if len(history) < _MIN_CADENCE_DAYS:
         facts.append(
             f"覆盖率: 交易日样本仅 {len(history)} 天，不足以判定披露频率，跳过"
@@ -297,17 +323,49 @@ def _check_coverage(catalog, arrow, problems: List[str], facts: List[str]) -> No
     if not daily:
         return
 
-    covered = by_day[target] & daily
-    pct = 100.0 * len(covered) / len(daily)
-    facts.append(
-        f"覆盖率 {pct:.2f}% @ `{target}`（日频基金 {len(daily):,}，"
-        f"按近 {len(history)} 个交易日 ≥{DAILY_CADENCE_MIN_PCT:.0f}% 披露判定）"
-    )
-    if pct < MIN_COVERAGE_PCT:
-        problems.append(
-            f"`{target}` 日频基金覆盖率 {pct:.2f}% 低于阈值 {MIN_COVERAGE_PCT}% — "
-            f"{len(daily) - len(covered):,} 只日频基金缺数据"
+    # Score each category against ITS OWN settle lag. Measured 2026-08-31 over
+    # the daily-cadence population, coverage by trading days back:
+    #
+    #     category   lag1     lag2     lag3
+    #     FOF        19.1%    99.8%   100.0%
+    #     混合型      100.0%   100.0%  100.0%
+    #     债券型       99.9%    99.9%  100.0%
+    #     指数型      100.0%   100.0%  100.0%
+    #     货币型/QDII 100.0%   100.0%  100.0%
+    #
+    # FOF simply needs one more settled day than everything else — it is a
+    # property of the product (fund-of-funds price off their holdings' NAVs),
+    # not of our collection. Two previous attempts tried to handle this by
+    # moving the cadence bar (80% -> 90%), and neither could work: on 2026-08-27
+    # 931 of the 945 funds reported missing had appearance rates of 99-101%.
+    # They publish nearly every day, then all skip the newest settled day
+    # together, so no cadence threshold excludes them. Upstream confirmed it
+    # had nothing for 20 of 20 sampled.
+    slow = {c for c in daily if categories.get(c) in _SLOW_SETTLE_CATEGORIES}
+    fast = daily - slow
+
+    for label, members, lag in (
+        ("日频", fast, 1),
+        ("FOF", slow, _SLOW_SETTLE_LAG),
+    ):
+        if not members:
+            continue
+        idx = -1 - lag
+        if len(trading) < lag + 1:
+            continue
+        day = trading[idx]
+        covered = by_day[day] & members
+        pct = 100.0 * len(covered) / len(members)
+        facts.append(
+            f"{label}覆盖率 {pct:.2f}% @ `{day}`（{len(members):,} 只"
+            + (f"，结算滞后 {lag} 个交易日" if lag > 1 else "")
+            + "）"
         )
+        if pct < MIN_COVERAGE_PCT:
+            problems.append(
+                f"`{day}` {label}覆盖率 {pct:.2f}% 低于阈值 {MIN_COVERAGE_PCT}% — "
+                f"{len(members) - len(covered):,} 只缺数据"
+            )
 
 
 def _check_export(problems: List[str], facts: List[str]) -> None:
