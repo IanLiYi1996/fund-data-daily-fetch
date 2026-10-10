@@ -120,7 +120,14 @@ TABLES: dict[str, TableSpec] = {
         schema=_fund_name_schema,
         partition_spec=_fund_name_partition,
         identifier_fields=["fund_code", "snapshot_date"],
-        write_mode="upsert",
+        # append, not upsert. Each day's snapshot is a new (fund_code,
+        # snapshot_date) key anyway, so upsert only ever bought dedup on
+        # re-runs — at the price of joining 28k rows against the whole
+        # 2.9M-row year partition: 877-894s measured, and past the 900s Lambda
+        # ceiling on 8 of 12 days to 2026-10-08, which lost the snapshot.
+        # Readers take the latest snapshot_date and drop_duplicates; weekly
+        # compaction collapses duplicates on the identifier fields.
+        write_mode="append",
         source_category="fund",
         date_specs=[
             DateColumnSpec(["数据日期", "snapshot_date"], "snapshot_date", "date"),
@@ -215,6 +222,9 @@ TABLES["fund_etf_daily"] = _simple_daily(
 TABLES["fund_graded_daily"] = _simple_daily(
     "fund_graded_daily",
     [("unit_nav", DoubleType), ("premium_pct", DoubleType)],
+    # Same upsert-scan problem as fund_name: 10k rows/day against 900k rows
+    # timed out on 7 of the 12 days to 2026-10-08.
+    write_mode="append",
 )
 TABLES["fund_value_estimation"] = TableSpec(
     name="fund_value_estimation",

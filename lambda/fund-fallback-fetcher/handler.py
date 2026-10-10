@@ -104,6 +104,38 @@ def _fetch_one(code_name, start_date: str, end_date: str):
     ]], None
 
 
+def _is_public_reit(fund_type: Optional[str]) -> bool:
+    """True for exchange-listed public REITs (fund_name.fund_type "Reits").
+
+    Deliberately NOT "QDII-REITs": those are open-end funds holding overseas
+    REIT shares and publish a NAV every trading day like any other QDII.
+    """
+    return bool(fund_type) and str(fund_type).startswith("Reits")
+
+
+def _quarantine_reit_rows(
+    merged: pd.DataFrame, reit_codes: set, target: date,
+) -> pd.DataFrame:
+    """Drop REIT rows dated the target day; they must survive a day upstream.
+
+    lsjz sometimes publishes, on the evening of a trading day, a row for a
+    public REIT dated that day and carrying the fund's last disclosed NAV, then
+    withdraws it hours or days later. Written as-is those rows said "508600 has
+    a NAV for 2026-09-30" when upstream had nothing for that date — 12 such
+    rows across 6 REITs by 2026-10-09, and the reconcile check could only ever
+    catch the ones it happened to sample. REITs disclose NAV quarterly, so a
+    same-day row is far more likely to be one of these than a real disclosure.
+
+    A quarantine rather than a skip: the 14-day fetch window re-fetches the
+    fund the next night, and a row upstream still carries then is written
+    then. Real disclosures land one day late; transient rows never land.
+    """
+    if merged.empty or not reit_codes:
+        return merged
+    drop = merged.fund_code.isin(reit_codes) & (merged.trade_date == target)
+    return merged[~drop]
+
+
 def _get_missing_universe(
     catalog, end_date: date, start_date: date,
 ) -> pd.DataFrame:
@@ -155,7 +187,11 @@ def _get_missing_universe(
         if v is not None
     }
 
-    return fn_latest[~fn_latest.fund_code.isin(covered)][["fund_code", "fund_name"]]
+    if "fund_type" not in fn_latest.columns:
+        fn_latest = fn_latest.assign(fund_type=None)
+    return fn_latest[~fn_latest.fund_code.isin(covered)][
+        ["fund_code", "fund_name", "fund_type"]
+    ]
 
 
 def _existing_pairs(catalog, start_date: date, end_date: date) -> set:
@@ -426,9 +462,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             lambda r: (r.fund_code, r.trade_date) in existing, axis=1
         )
     ]
+    # REIT rows dated today wait a day before we trust them (see the helper).
+    reit_codes = set(missing.fund_code[missing.fund_type.map(_is_public_reit)])
+    after_existing = len(merged)
+    merged = _quarantine_reit_rows(merged, reit_codes, end_date)
+    quarantined = after_existing - len(merged)
     logger.info(
         f"Recovered {merged.fund_code.nunique():,} funds, {len(merged):,} rows "
-        f"(dropped {before - len(merged):,} already present)"
+        f"(dropped {before - after_existing:,} already present, "
+        f"quarantined {quarantined} same-day REIT rows)"
     )
     if merged.empty:
         return {
@@ -451,6 +493,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         "missing": len(missing),
         "fetched": int(merged.fund_code.nunique()),
         "rows_appended": int(result.get("rows_appended", result.get("rows_inserted", 0))),
+        "quarantined_reit_rows": int(quarantined),
         "empty": empty,
         "errors": err,
         "money_verify": money,

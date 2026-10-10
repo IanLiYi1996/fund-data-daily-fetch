@@ -1,5 +1,25 @@
 import akshare as ak
+import pandas as pd
+
 from .base_fetcher import BaseFetcher, FetchResult, FetchSummary
+
+
+def _normalize_sina_spot(df: pd.DataFrame) -> pd.DataFrame:
+    """Shape Sina's ETF/LOF spot list like the eastmoney one it replaces.
+
+    Sina prefixes codes with the exchange ("sz159998", "sh510300"); everywhere
+    else in the lake fund_code is the bare 6-digit code, and fund_processor
+    joins top_etf.json on it. The Chinese headers Sina uses for price, change,
+    volume and turnover already match the eastmoney ones consumers key on, so
+    only the code needs touching.
+    """
+    if df is None or df.empty or "代码" not in df.columns:
+        return df
+    out = df.copy()
+    out["代码"] = out["代码"].astype(str).str.replace(
+        r"^(sh|sz|bj)", "", regex=True,
+    )
+    return out
 
 
 class FundFetcher(BaseFetcher):
@@ -19,7 +39,7 @@ class FundFetcher(BaseFetcher):
         "fund_etf": {
             "name_cn": "ETF实时行情",
             "description": "场内ETF基金实时交易数据，包含价格、成交量、涨跌幅",
-            "source_api": "fund_etf_spot_em",
+            "source_api": "fund_etf_category_sina(ETF基金)",
             "update_frequency": "realtime",
             "key_fields": ["代码", "名称", "最新价", "涨跌额", "涨跌幅", "成交量", "成交额"],
             "has_fee_data": False,
@@ -76,7 +96,7 @@ class FundFetcher(BaseFetcher):
         "fund_lof": {
             "name_cn": "LOF实时行情",
             "description": "LOF基金实时交易价格和折溢价数据",
-            "source_api": "fund_lof_spot_em",
+            "source_api": "fund_etf_category_sina(LOF基金)",
             "update_frequency": "realtime",
             "key_fields": ["代码", "名称", "最新价", "涨跌幅", "成交量", "净值", "折溢价率"],
             "has_fee_data": False,
@@ -279,9 +299,17 @@ class FundFetcher(BaseFetcher):
         df = ak.fund_open_fund_rank_em(symbol="全部")
         return df
 
+    # ETF and LOF spot quotes come from Sina, not eastmoney's push2 quote API.
+    # push2delay.eastmoney.com answered 502 (ETF) or dropped the connection
+    # (LOF, 88.push2) on every daily run from 2026-09-18 / 2026-08-26 through
+    # 2026-10-08, from Lambda and from an EC2 host alike, on akshare 1.18.60
+    # and 1.19.1 — the endpoint rejects this traffic, the client is not at
+    # fault. The Map state swallowed the per-table failure, so the two tables
+    # went stale for weeks while the workflow reported SUCCEEDED. Sina's list
+    # (fund_etf_category_sina) returned 1,694 ETFs / 360 LOFs in ~3s.
     def _fetch_fund_etf(self):
-        df = ak.fund_etf_spot_em()
-        return df
+        df = ak.fund_etf_category_sina(symbol="ETF基金")
+        return _normalize_sina_spot(df)
 
     def _fetch_fund_name(self):
         df = ak.fund_name_em()
@@ -316,8 +344,8 @@ class FundFetcher(BaseFetcher):
         return df
 
     def _fetch_fund_lof(self):
-        df = ak.fund_lof_spot_em()
-        return df
+        df = ak.fund_etf_category_sina(symbol="LOF基金")
+        return _normalize_sina_spot(df)
 
     def _fetch_fund_value_estimation(self):
         df = ak.fund_value_estimation_em()

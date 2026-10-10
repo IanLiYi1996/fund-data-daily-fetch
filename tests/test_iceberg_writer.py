@@ -39,7 +39,9 @@ class TestUpsert:
     These used to write to fund_daily, which moved to append mode in bb1fdbf
     (pyiceberg's upsert reads the whole table to dedup, and at ~30M rows it
     blew Lambda's 900s timeout). The tests kept asserting `rows_inserted` and
-    so had been failing rather than testing upsert at all. fund_name is a real
+    so had been failing rather than testing upsert at all. They then used
+    fund_name, which moved to append as well (2.9M rows, 877-894s per upsert,
+    timing out on 8 of 12 days to 2026-10-08). fund_performance is a real
     upsert table keyed on (fund_code, snapshot_date).
     """
 
@@ -47,19 +49,19 @@ class TestUpsert:
         df = pd.DataFrame({
             "基金代码": ["000001", "000002"],
             "基金简称": ["A", "B"],
-            "基金类型": ["混合型-灵活", "债券型-长债"],
+            "单位净值": [1.0, 2.0],
             "数据日期": ["2026-05-09", "2026-05-09"],
         })
-        result = writer.write("fund_name", df)
+        result = writer.write("fund_performance", df)
         assert result["rows_inserted"] == 2
         assert result.get("rows_updated", 0) == 0
 
     def test_second_write_same_pk_updates(self, writer):
         base = {"基金代码": ["000001"], "数据日期": ["2026-05-09"]}
-        writer.write("fund_name", pd.DataFrame(
-            {**base, "基金简称": ["A"], "基金类型": ["混合型-灵活"]}))
-        result = writer.write("fund_name", pd.DataFrame(
-            {**base, "基金简称": ["A 改名"], "基金类型": ["混合型-偏股"]}))
+        writer.write("fund_performance", pd.DataFrame(
+            {**base, "基金简称": ["A"], "单位净值": [1.0]}))
+        result = writer.write("fund_performance", pd.DataFrame(
+            {**base, "基金简称": ["A 改名"], "单位净值": [1.1]}))
         assert result["rows_updated"] == 1
         assert result["rows_inserted"] == 0
 
@@ -71,15 +73,30 @@ class TestUpsert:
         df = pd.DataFrame({
             "基金代码": ["000001", "000001"],
             "基金简称": ["旧名", "新名"],
-            "基金类型": ["混合型-灵活", "混合型-偏股"],
+            "单位净值": [1.0, 1.1],
             "数据日期": ["2026-05-09", "2026-05-09"],
         })
-        result = writer.write("fund_name", df)
+        result = writer.write("fund_performance", df)
         assert result["rows_inserted"] == 1
         out = writer.catalog.load_table(
-            ("fund_data_lake", "fund_name")
+            ("fund_data_lake", "fund_performance")
         ).scan().to_pandas()
         assert out["fund_name"].iloc[0] == "新名"
+
+    def test_fund_name_appends_rather_than_upserting(self, writer):
+        """Pins the append switch for the daily fund_name snapshot.
+
+        Each day is a new (fund_code, snapshot_date) key, so upsert bought
+        nothing but a join against the whole year partition that pushed the
+        write past Lambda's 900s ceiling.
+        """
+        df = pd.DataFrame({
+            "基金代码": ["000001"], "基金简称": ["A"],
+            "基金类型": ["混合型-灵活"], "数据日期": ["2026-05-09"],
+        })
+        result = writer.write("fund_name", df)
+        assert result["rows_appended"] == 1
+        assert "rows_updated" not in result
 
     def test_fund_daily_appends_rather_than_upserting(self, writer):
         """Pins the append switch that these tests previously contradicted.

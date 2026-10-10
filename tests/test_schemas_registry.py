@@ -59,6 +59,19 @@ def test_fund_dividend_is_append_event():
     assert TABLES["fund_dividend"].write_mode == "append"
 
 
+@pytest.mark.parametrize("name", ["fund_name", "fund_graded_daily"])
+def test_daily_snapshot_tables_append(name):
+    # append, not upsert, for the same reason as fund_daily: pyiceberg upsert
+    # joins the incoming batch against the whole table. fund_name reached
+    # 2.9M rows (107 daily snapshots in one year partition) and the write
+    # measured 877-894s on 2026-10-06/07, then hit the 900s Lambda ceiling on
+    # 8 of the 12 days to 2026-10-08, dropping the day's snapshot entirely.
+    # fund_graded_daily (900k rows) timed out on 7 of those days. Every reader
+    # already takes the latest snapshot_date and drop_duplicates on fund_code,
+    # and weekly compaction collapses duplicates on the identifier fields.
+    assert TABLES[name].write_mode == "append"
+
+
 def test_table_count_is_28():
     assert len(TABLES) == 28, f"Expected 28 tables, got {len(TABLES)}"
 

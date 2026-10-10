@@ -134,6 +134,36 @@ INACTIVE_AFTER_DAYS = int(os.environ.get("INACTIVE_AFTER_DAYS", "30"))
 # Cap the per-run age-in probe so the check stays well inside its timeout.
 MAX_AGE_IN_PROBES = int(os.environ.get("MAX_AGE_IN_PROBES", "60"))
 
+# Per-table staleness. The collection Map wraps every fund-table Lambda in a
+# catch, so a table that 502s or times out becomes a `success: false` item
+# (or, on a Lambda timeout, an error payload with no table name) and the
+# workflow still ends SUCCEEDED. Nothing read those items: fund_etf answered
+# 502 on every run from 2026-09-18 and fund_lof from 2026-08-26, fund_name
+# timed out on 8 of the 12 days to 2026-10-08, and this check kept reporting
+# the run as fine because it only looked at fund_daily.
+#
+# Same tolerance as MAX_LAG_DAYS: a long weekend plus one failed night.
+TABLE_MAX_AGE_DAYS = int(os.environ.get("TABLE_MAX_AGE_DAYS", "4"))
+# How far back the per-table probe looks. Anything older than this is
+# reported as "no recent rows" rather than with an exact date — scanning a
+# whole table for max(date) is what this check must not do.
+TABLE_PROBE_DAYS = int(os.environ.get("TABLE_PROBE_DAYS", "10"))
+# The fund tables the daily Map fans out over (mirrors FUND_TABLES in the CDK
+# stack), minus fund_daily, which has its own richer check above, and
+# fund_financial_daily, whose upstream endpoint has returned 0 rows on every
+# run since it was added — reporting it stale every day would only teach
+# people to ignore the line. fund_dividend and fund_split are also left out:
+# they are keyed on the EVENT date (ex-dividend / split day), not on when we
+# fetched, so "no row dated this week" is normal for them. Whether their
+# fetch ran is covered by the partition-outcome check in _check_workflow.
+DAILY_FUND_TABLES = (
+    "fund_performance", "fund_etf", "fund_name", "fund_manager",
+    "fund_money_daily", "fund_etf_daily", "fund_lof", "fund_value_estimation",
+    "fund_purchase", "fund_exchange_rank", "fund_money_rank", "fund_hk_rank",
+    "fund_rating", "fund_dividend_rank",
+    "fund_index_info", "fund_graded_daily", "fund_reits_daily",
+)
+
 
 # See slack-notifier/handler.py — the workflow's only variable is `text`,
 # and HTTP 200 from the trigger does not prove the message was delivered.
@@ -533,6 +563,150 @@ def _check_workflow(problems: List[str], facts: List[str]) -> None:
             f"最近一次采集是 {age_h:.0f} 小时前 — 定时触发可能已停止"
         )
 
+    # SUCCEEDED is the Map's verdict, not the tables'. Name the partitions
+    # that failed or never returned so a dead endpoint shows up the first
+    # night rather than weeks later in a stale-table count.
+    if status in ("SUCCEEDED", "FAILED", "TIMED_OUT"):
+        events: List[Dict[str, Any]] = []
+        kwargs: Dict[str, Any] = {
+            "executionArn": e["executionArn"], "maxResults": 1000,
+        }
+        while True:
+            page = sfn.get_execution_history(**kwargs)
+            events.extend(page.get("events", []))
+            if not page.get("nextToken"):
+                break
+            kwargs["nextToken"] = page["nextToken"]
+        failed, missing = _fund_partition_outcomes(events)
+        if failed:
+            problems.append(
+                f"采集子任务失败 {len(failed)} 张表（工作流仍为 SUCCEEDED）: "
+                + "; ".join(f"`{t}` {err[:60]}" for t, err in failed.items())
+            )
+        if missing:
+            problems.append(
+                f"采集子任务超时、未返回结果 {len(missing)} 张表: "
+                + ", ".join(f"`{t}`" for t in missing)
+            )
+
+
+def _fund_partition_outcomes(
+    events: List[Dict[str, Any]],
+) -> tuple[Dict[str, str], List[str]]:
+    """(failed table -> error, tables that never produced a named result).
+
+    The Map's iterations run concurrently, so entries and exits do not pair
+    up by order. A Lambda that returned carries its table name in the output
+    (success or not); a Lambda that timed out surfaces as the catch's error
+    payload with no table name at all. So "missing" is simply every table
+    that entered and never appeared in a named output.
+    """
+    entered: List[str] = []
+    named: set = set()
+    failed: Dict[str, str] = {}
+    for ev in events:
+        t = ev.get("type")
+        if t == "TaskStateEntered":
+            d = ev.get("stateEnteredEventDetails") or {}
+            if d.get("name") != "InvokeFundPartition":
+                continue
+            try:
+                table = json.loads(d.get("input") or "{}").get("table")
+            except ValueError:
+                table = None
+            if table:
+                entered.append(table)
+        elif t == "TaskStateExited":
+            d = ev.get("stateExitedEventDetails") or {}
+            if d.get("name") != "InvokeFundPartition":
+                continue
+            try:
+                out = json.loads(d.get("output") or "{}")
+            except ValueError:
+                continue
+            table = out.get("table") if isinstance(out, dict) else None
+            if not table:
+                continue  # timeout / error payload: no name to attach
+            named.add(table)
+            if out.get("success") is False:
+                errs = out.get("errors") or []
+                msg = (errs[0].get("error") if errs and isinstance(errs[0], dict)
+                       else out.get("error")) or "unknown error"
+                failed[table] = str(msg)
+    missing = [t for t in entered if t not in named]
+    return failed, missing
+
+
+def _stale_tables(
+    latest_by_table: Dict[str, Optional[date]], today: date, max_age_days: int,
+) -> List[tuple]:
+    """[(table, latest_date_or_None, age_days_or_None)] past the threshold.
+
+    None means the probe window held no rows at all — the table is stale by
+    more than the window, which is worse than any exact age, so those sort
+    first; the rest sort oldest first.
+    """
+    out: List[tuple] = []
+    for table, latest in latest_by_table.items():
+        if latest is None:
+            out.append((table, None, None))
+            continue
+        age = (today - latest).days
+        if age > max_age_days:
+            out.append((table, latest, age))
+    return sorted(out, key=lambda x: (x[1] is not None, x[1] or date.min))
+
+
+def _check_table_freshness(problems: List[str], facts: List[str]) -> None:
+    """Latest date per daily fund table, from what actually landed in the lake.
+
+    The partition-outcome check above says WHY a table stopped; this one says
+    THAT it stopped, and it keeps working even if the workflow plumbing or
+    the history parse changes shape. Probes a short window per table so it
+    costs partition-pruned scans of one column, never a full-table max().
+    """
+    from pyiceberg.types import TimestampType, TimestamptzType
+
+    from shared.schemas import TABLES
+
+    catalog = _catalog()
+    today = date.today()
+    since = today - timedelta(days=TABLE_PROBE_DAYS)
+    latest: Dict[str, Optional[date]] = {}
+    for name in DAILY_FUND_TABLES:
+        spec = TABLES.get(name)
+        if spec is None or not spec.date_specs:
+            continue
+        col = spec.date_specs[0].target
+        try:
+            tbl = catalog.load_table(("fund_data_lake", name))
+            ftype = tbl.schema().find_field(col).field_type
+            lo: Any = since
+            if isinstance(ftype, (TimestampType, TimestamptzType)):
+                lo = datetime(since.year, since.month, since.day)
+            vals = tbl.scan(
+                row_filter=GreaterThanOrEqual(col, lo),
+                selected_fields=(col,),
+            ).to_arrow()[col].to_pylist()
+        except Exception as ex:
+            problems.append(f"`{name}` 无法读取: {type(ex).__name__}")
+            continue
+        days = [v.date() if isinstance(v, datetime) else v for v in vals if v is not None]
+        latest[name] = max(days) if days else None
+
+    stale = _stale_tables(latest, today=today, max_age_days=TABLE_MAX_AGE_DAYS)
+    fresh = len(latest) - len(stale)
+    facts.append(f"基金日表新鲜度: {fresh}/{len(latest)} 张在 {TABLE_MAX_AGE_DAYS} 天内有数据")
+    if stale:
+        problems.append(
+            f"{len(stale)} 张基金表停更: "
+            + ", ".join(
+                f"`{t}` 最近 {TABLE_PROBE_DAYS} 天无数据" if d is None
+                else f"`{t}` 最新 {d}（{a} 天前）"
+                for t, d, a in stale
+            )
+        )
+
 
 def _has_upstream_series(fund_code: str) -> bool:
     """True if 天天基金 still publishes a NAV history for this code."""
@@ -842,8 +1016,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     problems: List[str] = []
     facts: List[str] = []
 
-    for check in (_check_workflow, _check_fund_daily, _check_export,
-                  _check_history_exports, _check_upstream):
+    for check in (_check_workflow, _check_fund_daily, _check_table_freshness,
+                  _check_export, _check_history_exports, _check_upstream):
         try:
             check(problems, facts)
         except Exception as e:
