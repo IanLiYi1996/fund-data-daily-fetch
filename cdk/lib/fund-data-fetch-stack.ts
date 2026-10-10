@@ -1023,10 +1023,16 @@ export class FundDataFetchStack extends Stack {
     slackWebhookSecret.grantRead(freshnessCheckLambda);
 
     // The heartbeat reports on the latest collection run, so it needs to
-    // read execution history (not start anything).
+    // read execution history (not start anything). GetExecutionHistory is
+    // what lets it name the fund-table partitions that failed or timed out
+    // inside a SUCCEEDED run — the Map's catch hides them from the status.
     freshnessCheckLambda.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ["states:ListExecutions", "states:DescribeExecution"],
+        actions: [
+          "states:ListExecutions",
+          "states:DescribeExecution",
+          "states:GetExecutionHistory",
+        ],
         resources: [
           this.stateMachine.stateMachineArn,
           `arn:aws:states:${this.region}:${this.account}:execution:${this.stateMachine.stateMachineName}:*`,

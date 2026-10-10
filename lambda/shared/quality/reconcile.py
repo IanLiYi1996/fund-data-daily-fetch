@@ -83,6 +83,11 @@ _STRATA_PREFIXES = {
     "qdii": ("QDII",),
     "bond": ("债券型",),
     "equity": ("股票型", "混合型"),
+    # Public REITs (~100 codes) used to fall into "other" and were sampled
+    # about once a month; the phantom same-day rows upstream publishes and
+    # withdraws for them (12 across 6 REITs by 2026-10-09) took that long to
+    # surface. "QDII-REITs" starts with QDII and stays in that stratum.
+    "reit": ("Reits",),
 }
 
 
@@ -253,7 +258,7 @@ def reconcile(catalog, seed: Optional[int] = None) -> Dict:
                     f.cancel()
                 break
 
-    for code, _name, _stratum in sample:
+    for code, _name, stratum in sample:
         if code not in fetched:
             continue  # cancelled by the budget; not counted either way
         up = fetched[code]
@@ -261,6 +266,13 @@ def reconcile(catalog, seed: Optional[int] = None) -> Dict:
             probe_errors += 1
             continue
         ours = mine.get(code, {})
+        if stratum == "reit":
+            # The fallback quarantines REIT rows dated the run day for one
+            # night (upstream publishes and withdraws such rows), so a real
+            # same-day disclosure is deliberately a day late on our side.
+            # Comparing the newest day would report that lag as a defect.
+            up = {d: v for d, v in up.items() if d < hi}
+            ours = {d: v for d, v in ours.items() if d < hi}
         if not ours and not up:
             continue
         checked += 1
