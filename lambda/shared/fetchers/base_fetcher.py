@@ -1,13 +1,54 @@
 """Base fetcher with dual-write helper (raw S3 parquet + Iceberg)."""
 from __future__ import annotations
 
+import http.client
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
 import pandas as pd
+import requests
+import urllib3
+
 
 from shared.utils.logger import get_logger
+
+# Upstreams (eastmoney especially) sometimes cut a connection mid-response.
+# fund_money_fund_daily_em died ~1s in with "Response ended prematurely" on
+# 2026-10-17 and 2026-10-20 and the table missed 10-20; a manual re-run
+# minutes later fetched all 544 rows. These fast connection drops are worth
+# retrying. Timeouts and HTTP status errors are not: a timeout already costs
+# its full wait, and 4xx/5xx from a dead endpoint (push2delay 502s, Sep-Oct
+# 2026) do not clear in seconds.
+TRANSIENT_MAX_ATTEMPTS = 3
+TRANSIENT_BACKOFF_SECONDS = (2.0, 5.0)
+# Only retry when the failed attempt was quick. A drop after minutes of
+# work could push a partition past the 15 min Lambda timeout on re-run.
+TRANSIENT_RETRY_MAX_ELAPSED = 60.0
+
+_TRANSIENT_TYPES = (
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ConnectionError,
+    urllib3.exceptions.ProtocolError,
+    http.client.RemoteDisconnected,
+    http.client.IncompleteRead,
+    ConnectionResetError,
+)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True if exc, or anything in its cause/context chain, is a connection drop."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        # ConnectTimeout subclasses ConnectionError; timeouts are excluded.
+        if isinstance(exc, _TRANSIENT_TYPES) and not isinstance(
+            exc, requests.exceptions.Timeout
+        ):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
 @dataclass
@@ -57,10 +98,13 @@ class BaseFetcher(ABC):
     def fetch_all(self) -> FetchSummary: ...
 
     def _safe_fetch(self, name: str, fetch_func, *args, **kwargs) -> FetchResult:
-        """Invoke a fetch function and wrap success/failure in a FetchResult."""
+        """Invoke a fetch function and wrap success/failure in a FetchResult.
+
+        Fast connection drops are retried up to TRANSIENT_MAX_ATTEMPTS times.
+        """
         try:
             self.logger.info(f"Fetching {name}...")
-            df = fetch_func(*args, **kwargs)
+            df = self._call_with_retry(name, fetch_func, *args, **kwargs)
             if df is None or df.empty:
                 self.logger.warning(f"{name}: No data returned")
                 return FetchResult(name=name, success=True, data=pd.DataFrame())
@@ -69,6 +113,29 @@ class BaseFetcher(ABC):
         except Exception as e:
             self.logger.error(f"{name}: Failed to fetch - {e}")
             return FetchResult(name=name, success=False, error=str(e))
+
+    def _call_with_retry(self, name: str, fetch_func, *args, **kwargs):
+        for attempt in range(1, TRANSIENT_MAX_ATTEMPTS + 1):
+            started = time.monotonic()
+            try:
+                return fetch_func(*args, **kwargs)
+            except Exception as e:
+                elapsed = time.monotonic() - started
+                if (
+                    attempt >= TRANSIENT_MAX_ATTEMPTS
+                    or elapsed > TRANSIENT_RETRY_MAX_ELAPSED
+                    or not _is_transient(e)
+                ):
+                    raise
+                delay = TRANSIENT_BACKOFF_SECONDS[
+                    min(attempt - 1, len(TRANSIENT_BACKOFF_SECONDS) - 1)
+                ]
+                self.logger.warning(
+                    f"{name}: transient {type(e).__name__} after {elapsed:.1f}s "
+                    f"(attempt {attempt}/{TRANSIENT_MAX_ATTEMPTS}): {e}; "
+                    f"retrying in {delay:.0f}s"
+                )
+                time.sleep(delay)
 
     def dual_write(
         self,
