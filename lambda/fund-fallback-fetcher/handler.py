@@ -136,10 +136,60 @@ def _quarantine_reit_rows(
     return merged[~drop]
 
 
+# Overseas funds publish NAV late (T+1, T+2), so the target-day gap alone
+# misses them: on 2026-10-19 024149 was in the gap but lsjz had no 10-19 yet,
+# and by 10-20 the snapshot had written 10-20, so 10-19 was never asked for
+# again. A manual 10-19 re-run recovered 12 such QDII rows. Re-check overseas
+# funds holding a hole on any of the last few market trading days.
+LATE_OVERSEAS_DAYS = 3
+# A date counts as a market trading day only if this many funds have a NAV
+# on it; ~24k do on a normal day, a handful on exchange holidays.
+LATE_MARKET_MIN_FUNDS = 10000
+
+
+def _is_overseas(fund_name: Optional[str], fund_type: Optional[str]) -> bool:
+    """QDII by type or name. Some QDII index funds are typed 指数型-海外股票."""
+    t = str(fund_type or "")
+    return t.startswith("QDII") or "海外" in t or "QDII" in str(fund_name or "")
+
+
+def _late_overseas_codes(
+    universe: pd.DataFrame, pairs: set, end_date: date,
+    n_days: int = LATE_OVERSEAS_DAYS,
+) -> set:
+    """Overseas codes with a NAV hole on one of the n trading days before end_date.
+
+    ``pairs`` is (fund_code, trade_date) holding a NAV. Funds with no NAV at
+    all in the window are skipped: they are dormant or new, not late.
+    """
+    per_day: Dict[date, int] = {}
+    for _, d in pairs:
+        per_day[d] = per_day.get(d, 0) + 1
+    days = sorted(
+        (d for d, n in per_day.items()
+         if d < end_date and n >= LATE_MARKET_MIN_FUNDS),
+        reverse=True,
+    )[:n_days]
+    if not days:
+        return set()
+    window = set(days) | {end_date}
+    have: Dict[str, set] = {}
+    for c, d in pairs:
+        if d in window:
+            have.setdefault(c, set()).add(d)
+    out = set()
+    for code, name, ftype in zip(universe.fund_code, universe.fund_name,
+                                 universe.fund_type):
+        got = have.get(code)
+        if got and _is_overseas(name, ftype) and any(d not in got for d in days):
+            out.add(code)
+    return out
+
+
 def _get_missing_universe(
     catalog, end_date: date, start_date: date,
 ) -> pd.DataFrame:
-    """Funds with no fund_daily row ON end_date.
+    """Funds with no fund_daily row ON end_date, plus late overseas funds.
 
     The gap is computed for the target day alone, while the FETCH window
     stays [start_date, end_date] — those are deliberately different spans.
@@ -158,6 +208,9 @@ def _get_missing_universe(
     fn_latest = (
         fn[fn.snapshot_date == latest].drop_duplicates("fund_code").reset_index(drop=True)
     )
+    # Full universe for the late-overseas check, before weekend scoping.
+    fn_all = (fn_latest if "fund_type" in fn_latest.columns
+              else fn_latest.assign(fund_type=None))
 
     # On non-trading days only money-market funds accrue, so scoping the gap
     # to the full universe asks for ~27k codes and guarantees a timeout — the
@@ -189,9 +242,17 @@ def _get_missing_universe(
 
     if "fund_type" not in fn_latest.columns:
         fn_latest = fn_latest.assign(fund_type=None)
-    return fn_latest[~fn_latest.fund_code.isin(covered)][
-        ["fund_code", "fund_name", "fund_type"]
-    ]
+    gap = fn_latest[~fn_latest.fund_code.isin(covered)]
+
+    late = _late_overseas_codes(
+        fn_all,
+        _existing_pairs(catalog, end_date - timedelta(days=10), end_date),
+        end_date,
+    ) - set(gap.fund_code)
+    if late:
+        logger.info(f"late overseas: re-checking {len(late)} QDII funds with recent holes")
+        gap = pd.concat([gap, fn_all[fn_all.fund_code.isin(late)]])
+    return gap[["fund_code", "fund_name", "fund_type"]].reset_index(drop=True)
 
 
 def _existing_pairs(catalog, start_date: date, end_date: date) -> set:
