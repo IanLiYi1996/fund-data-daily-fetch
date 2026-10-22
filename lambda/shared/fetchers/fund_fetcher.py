@@ -1,5 +1,9 @@
+import math
+import re
+
 import akshare as ak
 import pandas as pd
+import requests
 
 from .base_fetcher import BaseFetcher, FetchResult, FetchSummary
 
@@ -20,6 +24,85 @@ def _normalize_sina_spot(df: pd.DataFrame) -> pd.DataFrame:
         r"^(sh|sz|bj)", "", regex=True,
     )
     return out
+
+
+# REIT quotes come from Sina hq, not ak.reits_realtime_em. That calls
+# 95.push2.eastmoney.com, the push2 quote API that already killed fund_etf /
+# fund_lof: it failed 11 days since July (all 3 retries RemoteDisconnected on
+# 2026-10-21), and on 10-22 every push2 host (95./82./push2/push2delay)
+# answered empty or 502 to most probes. It also hard-codes pz=100 while the
+# market lists 103 REITs, so successful runs silently dropped 3 a day.
+_SINA_HQ_URL = "https://hq.sinajs.cn/list="
+_SINA_HQ_BATCH = 200
+_SINA_HQ_LINE = re.compile(r'var hq_str_(sh|sz)(\d{6})="([^"]*)"')
+
+
+def _sina_symbol(code: str):
+    """Exchange-prefixed Sina symbol for a listed REIT code."""
+    if code.startswith("5"):
+        return f"sh{code}"
+    if code.startswith("1"):
+        return f"sz{code}"
+    return None
+
+
+def _reit_codes(fund_name_df: pd.DataFrame) -> list:
+    """Exchange-listed public REITs (excludes QDII-REITs, which are OTC funds)."""
+    mask = fund_name_df["基金类型"].astype(str) == "Reits"
+    return fund_name_df.loc[mask, "基金代码"].astype(str).tolist()
+
+
+def _get_sina_hq(symbols: list) -> str:
+    r = requests.get(
+        _SINA_HQ_URL + ",".join(symbols),
+        headers={"Referer": "https://finance.sina.com.cn",
+                 "User-Agent": "Mozilla/5.0"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    r.encoding = "gbk"
+    return r.text
+
+
+def _num(v: str) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return math.nan
+
+
+def _parse_sina_hq(text: str) -> pd.DataFrame:
+    """Sina hq lines -> the eastmoney reits_realtime_em column shape.
+
+    Sina fields: 0 name, 1 open, 2 prev close, 3 price, 4 high, 5 low,
+    8 volume (shares), 9 turnover (yuan), 30 date. 成交量 is converted to 手
+    to match eastmoney's f5 and the existing series. A price of 0 means no
+    trade yet / suspended; it becomes NaN as eastmoney's "-" did.
+    """
+    rows = []
+    for _, code, body in _SINA_HQ_LINE.findall(text):
+        f = body.split(",")
+        if len(f) < 31:
+            continue
+        price, prev = _num(f[3]), _num(f[2])
+        if not price:
+            price = math.nan
+        traded = not math.isnan(price) and bool(prev)
+        rows.append({
+            "代码": code,
+            "名称": f[0],
+            "最新价": price,
+            "涨跌额": round(price - prev, 3) if traded else math.nan,
+            "涨跌幅": round((price / prev - 1) * 100, 2) if traded else math.nan,
+            "成交量": _num(f[8]) / 100,
+            "成交额": _num(f[9]),
+            "开盘价": _num(f[1]) or math.nan,
+            "最高价": _num(f[4]) or math.nan,
+            "最低价": _num(f[5]) or math.nan,
+            "昨收": prev,
+            "数据日期": f[30],
+        })
+    return pd.DataFrame(rows)
 
 
 class FundFetcher(BaseFetcher):
@@ -214,7 +297,7 @@ class FundFetcher(BaseFetcher):
         "fund_reits_daily": {
             "name_cn": "公募 REITs",
             "description": "公募 REITs 实时行情",
-            "source_api": "public_fund_REITs",
+            "source_api": "fund_name_em(Reits) + Sina hq.sinajs.cn",
             "update_frequency": "daily",
             "key_fields": ["代码", "名称", "最新价", "涨跌幅"],
             "has_fee_data": False,
@@ -445,8 +528,31 @@ class FundFetcher(BaseFetcher):
         return pd.DataFrame()
 
     def _fetch_fund_reits_daily(self):
-        # akshare 1.18: reits_realtime_em covers public REITs intraday prices.
-        return ak.reits_realtime_em()
+        fn = ak.fund_name_em()
+        codes = _reit_codes(fn)
+        symbols = [s for s in map(_sina_symbol, codes) if s]
+        text = "".join(
+            _get_sina_hq(symbols[i:i + _SINA_HQ_BATCH])
+            for i in range(0, len(symbols), _SINA_HQ_BATCH)
+        )
+        df = _parse_sina_hq(text)
+        if symbols and df.empty:
+            raise ValueError(
+                f"Sina hq returned 0 of {len(symbols)} REIT quotes"
+            )
+        # Registered-but-not-yet-trading REITs (14 on 2026-10-22) get no
+        # Sina quote at all. eastmoney listed them with a null price, so keep
+        # an unpriced row to hold the per-day REIT universe steady.
+        missing = [c for c in codes if c not in set(df["代码"])]
+        if missing:
+            names = dict(zip(fn["基金代码"].astype(str), fn["基金简称"]))
+            quote_date = df["数据日期"].mode().iloc[0]
+            df = pd.concat([df, pd.DataFrame({
+                "代码": missing,
+                "名称": [names.get(c) for c in missing],
+                "数据日期": quote_date,
+            })], ignore_index=True)
+        return df
 
     def _fetch_fund_portfolio_hold(self):
         import pandas as pd
