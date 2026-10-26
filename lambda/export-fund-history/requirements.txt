@@ -1,2 +1,3 @@
-duckdb>=1.1.0
+# Keep runtime and regression tests on the same, explicitly tested API.
+duckdb==2.0.0
 boto3>=1.34.0
