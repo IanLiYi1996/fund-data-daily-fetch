@@ -159,7 +159,9 @@ def _export_month(ym: str, tmp: Path) -> Dict[str, Any]:
     if not local.exists() or local.stat().st_size == 0:
         return {"month": ym, "rows": 0, "bytes": 0, "skipped": "empty"}
 
-    rows = con.sql(f"SELECT COUNT(*) FROM read_parquet('{local}')").fetchone()[0]
+    # A relation no longer exposes fetchone() in DuckDB 2.0. COUNT returns
+    # one row, so fetchall keeps this compatible without skipping the upload.
+    rows = con.sql(f"SELECT COUNT(*) FROM read_parquet('{local}')").fetchall()[0][0]
     size = local.stat().st_size
 
     s3 = boto3.client("s3", region_name=REGION)
