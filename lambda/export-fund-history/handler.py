@@ -1,4 +1,4 @@
-"""Export the current month's fund NAV history to a single parquet file.
+"""Export recent fund NAV history to one consumer parquet file per month.
 
 Reads s3://bucket/fund-data-pipeline/iceberg/fund_data_lake.db/fund_daily/data/
 trade_month=YYYY-MM/*.parquet, dedupes on (fund_code, trade_date), writes one
@@ -6,7 +6,9 @@ consolidated parquet to s3://bucket/fund-data-pipeline/fund_history/
 trade_month=YYYY-MM/part-0.parquet. S3 Replication then mirrors to
 financial-dataset-mx/fund-data-pipeline/fund_history/ for Mengxin's use.
 
-Only the current month is touched in the daily run — older months don't change.
+Daily runs refresh the current AND previous month, so delayed NAV publication
+across a month boundary still reaches consumers. A month with no live source
+files is reported as waiting, never populated with fabricated/old-month rows.
 Month can be overridden via event.month='YYYY-MM' for ad-hoc re-export.
 
 The file list comes from the Iceberg snapshot, NOT a glob over the data
@@ -31,15 +33,12 @@ from typing import Any, Dict
 import boto3
 import duckdb
 
+from shared.quality.export_policy import export_months, month_start
+
 BUCKET = os.environ["S3_BUCKET"]
 S3_PREFIX = os.environ.get("S3_PREFIX", "fund-data-pipeline/")
 DST_PREFIX = f"{S3_PREFIX}fund_history"
 REGION = os.environ.get("AWS_REGION", "us-east-1")
-
-
-def _this_month() -> str:
-    t = date.today()
-    return f"{t.year:04d}-{t.month:02d}"
 
 
 def _duckdb(tmp: Path):
@@ -60,8 +59,8 @@ def _duckdb(tmp: Path):
     return con
 
 
-def _live_files(ym: str, con) -> list[str]:
-    """Data files belonging to the current snapshot for one month partition.
+def _snapshot_files(con) -> list[str]:
+    """Data files belonging to one current snapshot, across all months.
 
     Resolved straight from the Iceberg metadata via boto3 — Glue gives the
     pointer to metadata.json, which lists the manifests, which list the data
@@ -97,25 +96,31 @@ def _live_files(ym: str, con) -> list[str]:
             f"SELECT manifest_path FROM read_avro('{manifest_list_uri}')"
         ).fetchall()
     ]
-    prefix = f"trade_month={ym}/"
     files: list[str] = []
     for mf in manifests:
         rows = con.sql(
             f"SELECT data_file.file_path, status FROM read_avro('{mf}')"
         ).fetchall()
         # status 2 == DELETED; those files are not part of the snapshot
-        files.extend(fp for fp, st in rows if st != 2 and prefix in fp)
+        files.extend(fp for fp, st in rows if st != 2)
     return files
 
 
-def _export_month(ym: str, tmp: Path) -> Dict[str, Any]:
+def _live_files(ym: str, con) -> list[str]:
+    """Compatibility seam for a one-month read of the live snapshot."""
+    prefix = f"trade_month={ym}/"
+    return [fp for fp in _snapshot_files(con) if prefix in fp]
+
+
+def _export_month(
+    ym: str, tmp: Path, *, con=None, live: list[str] | None = None,
+) -> Dict[str, Any]:
     """Dedupe + write one month's parquet; upload to S3. Returns stats."""
     dst_key = f"{DST_PREFIX}/trade_month={ym}/part-0.parquet"
     local = tmp / f"{ym}.parquet"
 
-    con = _duckdb(tmp)
-
-    live = _live_files(ym, con)
+    con = con if con is not None else _duckdb(tmp)
+    live = _live_files(ym, con) if live is None else live
     if not live:
         return {"month": ym, "rows": 0, "bytes": 0, "skipped": "no-live-files"}
 
@@ -182,9 +187,34 @@ def _export_month(ym: str, tmp: Path) -> Dict[str, Any]:
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    ym = event.get("month") or _this_month()
+    explicit = event.get("month")
+    if explicit is not None:
+        month_start(explicit)
+        months = (explicit,)
+    else:
+        months = export_months(date.today())
     with tempfile.TemporaryDirectory() as td:
-        result = _export_month(ym, Path(td))
+        tmp = Path(td)
+        con = _duckdb(tmp)
+        try:
+            # Read metadata/manifests once, so both months use the same
+            # snapshot without doubling remote manifest I/O.
+            files = _snapshot_files(con)
+            exports = [
+                _export_month(ym, tmp, con=con, live=[
+                    fp for fp in files if f"trade_month={ym}/" in fp
+                ])
+                for ym in months
+            ]
+        finally:
+            con.close()
+    populated = [r for r in exports if r.get("rows", 0) > 0]
+    result = dict(populated[-1] if populated else exports[-1])
+    if explicit is None:
+        result["exports"] = exports
+        result["waiting_months"] = [
+            r["month"] for r in exports if r.get("skipped") == "no-live-files"
+        ]
     result.update({
         "statusCode": 200,
         "downloader": "export-fund-history",

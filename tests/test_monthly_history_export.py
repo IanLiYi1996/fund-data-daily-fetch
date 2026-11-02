@@ -83,6 +83,9 @@ def monthly_export(monkeypatch, tmp_path):
             )
             return self.connection.sql(query)
 
+        def close(self):
+            self.connection.close()
+
     monkeypatch.setattr(duckdb, "connect", FixtureConnection)
     monkeypatch.setenv("S3_BUCKET", bucket)
     monkeypatch.setenv("S3_PREFIX", prefix)
@@ -164,3 +167,86 @@ def test_monthly_history_does_not_overwrite_export_with_deleted_snapshot_files(m
     assert result["success"] is False
     assert result["skipped"] == "no-live-files"
     assert s3.get_object(Bucket=bucket, Key=key)["Body"].read() == b"existing consumer export"
+
+
+def _pin_day(monkeypatch, handler, day):
+    class PinnedDate(date):
+        @classmethod
+        def today(cls):
+            return day
+
+    monkeypatch.setattr(handler, "date", PinnedDate)
+
+
+def test_month_rollover_exports_october_when_november_has_no_rows(monthly_export, monkeypatch):
+    handler, s3, bucket, _, _ = monthly_export
+    _pin_day(monkeypatch, handler, date(2026, 11, 1))
+
+    result = handler.lambda_handler({}, None)
+
+    assert result["success"] is True
+    assert result["month"] == "2026-10"
+    assert result["rows"] == 2
+    assert result["waiting_months"] == ["2026-11"]
+    assert [x["month"] for x in result["exports"]] == ["2026-10", "2026-11"]
+    assert s3.head_object(Bucket=bucket, Key=result["s3_key"])["ContentLength"] > 0
+    assert not s3.list_objects_v2(
+        Bucket=bucket, Prefix="fund-data-pipeline/fund_history/trade_month=2026-11/",
+    ).get("Contents")
+
+
+def test_current_and_previous_month_refresh_include_late_nav(monthly_export, monkeypatch):
+    handler, s3, bucket, october_file, manifest = monthly_export
+    _pin_day(monkeypatch, handler, date(2026, 11, 2))
+    original = pq.ParquetFile(october_file).read().to_pylist()
+    late = {
+        **original[-1], "fund_code": "019309", "trade_date": date(2026, 10, 30),
+        "unit_nav": 1.1313, "ingested_at": datetime(2026, 11, 1, 17),
+    }
+    pq.write_table(pa.Table.from_pylist(original + [late]), october_file)
+    november_dir = october_file.parent.parent / "trade_month=2026-11"
+    november_dir.mkdir()
+    november_file = november_dir / "data.parquet"
+    pq.write_table(pa.Table.from_pylist([{
+        **original[-1], "trade_date": date(2026, 11, 2),
+        "ingested_at": datetime(2026, 11, 2, 17),
+    }]), november_file)
+    pq.write_table(pa.Table.from_pylist([
+        {"data_file": {"file_path": str(october_file)}, "status": 1},
+        {"data_file": {"file_path": str(november_file)}, "status": 1},
+    ]), manifest)
+
+    result = handler.lambda_handler({}, None)
+
+    assert result["success"] is True
+    assert result["month"] == "2026-11"
+    assert [(x["month"], x["rows"]) for x in result["exports"]] == [
+        ("2026-10", 3), ("2026-11", 1),
+    ]
+    assert result["waiting_months"] == []
+    october = s3.get_object(
+        Bucket=bucket,
+        Key="fund-data-pipeline/fund_history/trade_month=2026-10/part-0.parquet",
+    )["Body"].read()
+    rows = pq.ParquetFile(pa.BufferReader(october)).read().to_pylist()
+    assert any(r["fund_code"] == "019309" and r["unit_nav"] == 1.1313 for r in rows)
+
+
+def test_default_empty_two_months_is_not_false_success(monthly_export, monkeypatch):
+    handler, _, _, data_file, manifest = monthly_export
+    _pin_day(monkeypatch, handler, date(2026, 11, 1))
+    pq.write_table(pa.Table.from_pylist([
+        {"data_file": {"file_path": str(data_file)}, "status": 2},
+    ]), manifest)
+
+    result = handler.lambda_handler({}, None)
+
+    assert result["success"] is False
+    assert result["waiting_months"] == ["2026-10", "2026-11"]
+
+
+@pytest.mark.parametrize("month", ["2026-13", "../2026-10", "2026-1", "2026-10/extra"])
+def test_explicit_month_is_validated_before_reading_or_writing(monthly_export, month):
+    handler, _, _, _, _ = monthly_export
+    with pytest.raises(ValueError, match="month"):
+        handler.lambda_handler({"month": month}, None)

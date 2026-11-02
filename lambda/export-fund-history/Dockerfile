@@ -12,6 +12,7 @@ COPY export-fund-history/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY export-fund-history/handler.py .
+COPY shared/quality/export_policy.py ./shared/quality/export_policy.py
 
 # Pre-install DuckDB extensions into an in-image cache: Lambda has no
 # egress for extension downloads, so anything missing here fails at runtime.

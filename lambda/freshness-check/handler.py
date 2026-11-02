@@ -22,7 +22,7 @@ channel gets one post a day, so silence means the monitor itself stopped):
    funds) present on the last settled trading day. An absolute floor is
    blind to real regressions: at 26.7k active codes and a 20k floor,
    losing 2,000 live funds still passes.
-4. **export + replication** — the current month's parquet was written
+4. **export + replication** — recent months that have actual NAV data were written
    within ``MAX_EXPORT_LAG_HOURS`` and its ``ReplicationStatus`` is
    COMPLETED, i.e. it reached the consumer bucket.
 5. **history exports** — age AND distinct-fund count of the three flat
@@ -45,8 +45,9 @@ from typing import Any, Dict, List, Optional
 
 import boto3
 from pyiceberg.catalog import load_catalog
-from pyiceberg.expressions import GreaterThanOrEqual
+from pyiceberg.expressions import And, GreaterThanOrEqual, LessThanOrEqual
 
+from shared.quality.export_policy import export_months, month_start
 from shared.storage.iceberg_writer import IcebergWriter
 from shared.utils.logger import get_logger
 
@@ -400,15 +401,37 @@ def _check_coverage(catalog, arrow, problems: List[str], facts: List[str]) -> No
 
 def _check_export(problems: List[str], facts: List[str]) -> None:
     today = date.today()
-    key = (
-        f"{S3_PREFIX}fund_history/"
-        f"trade_month={today.year:04d}-{today.month:02d}/part-0.parquet"
-    )
+    months = export_months(today)
+    # At a month boundary the latest NAV can legitimately still be in the
+    # previous month. Probe real dates, not the calendar or S3 existence:
+    # otherwise falling back to October would hide a missing November file
+    # AFTER November data arrives. Checking both months also catches late
+    # October NAVs that the collection wrote on November 1.
+    dates = _catalog().load_table(("fund_data_lake", "fund_daily")).scan(
+        row_filter=And(
+            GreaterThanOrEqual("trade_date", month_start(months[0])),
+            LessThanOrEqual("trade_date", today),
+        ),
+        selected_fields=("trade_date",),
+    ).to_arrow()["trade_date"].unique().to_pylist()
+    present = {day.strftime("%Y-%m") for day in dates if day is not None}
+    if not present:
+        problems.append("导出检查：最近两个月没有净值数据")
+        return
     s3 = boto3.client("s3", region_name=REGION)
+    for month in months:
+        if month not in present:
+            facts.append(f"导出 `trade_month={month}`：尚无净值数据，等待首条记录")
+            continue
+        _check_export_month(s3, month, problems, facts)
+
+
+def _check_export_month(s3, month: str, problems: List[str], facts: List[str]) -> None:
+    key = f"{S3_PREFIX}fund_history/trade_month={month}/part-0.parquet"
     try:
         head = s3.head_object(Bucket=BUCKET, Key=key)
     except s3.exceptions.ClientError as e:
-        problems.append(f"本月导出文件不存在或不可读: `{key}` ({e.response['Error']['Code']})")
+        problems.append(f"导出文件不存在或不可读: `{key}` ({e.response['Error']['Code']})")
         return
 
     modified = head["LastModified"]
@@ -423,12 +446,12 @@ def _check_export(problems: List[str], facts: List[str]) -> None:
 
     if age_h > MAX_EXPORT_LAG_HOURS:
         problems.append(
-            f"本月导出已 {age_h:.1f} 小时未更新"
+            f"`trade_month={month}` 导出已 {age_h:.1f} 小时未更新"
             f"（阈值 {MAX_EXPORT_LAG_HOURS}h）— 孟老板拿不到新数据"
         )
     if repl not in ("COMPLETED", "REPLICA"):
         problems.append(
-            f"导出文件复制状态是 `{repl}`，未确认送达消费方账号"
+            f"`trade_month={month}` 导出文件复制状态是 `{repl}`，未确认送达消费方账号"
         )
 
 
