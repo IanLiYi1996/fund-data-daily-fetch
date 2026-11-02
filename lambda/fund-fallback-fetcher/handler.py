@@ -146,6 +146,27 @@ LATE_OVERSEAS_DAYS = 3
 # on it; ~24k do on a normal day, a handful on exchange holidays.
 LATE_MARKET_MIN_FUNDS = 10000
 
+# Recheck the first few days of a new or resumed series even if today's
+# snapshot already covers it. 029238 first appeared on 10-29; lsjz also held
+# its 10-28 inception NAV, which the target-day gap could never select again.
+RECENT_REPORTING_DAYS = 3
+
+
+def _recently_reporting_codes(pairs: set, end_date: date) -> set:
+    """Codes whose first observed NAV in the ten-day scan is recent.
+
+    This includes domestic and untyped new/resumed funds, but not every
+    historical hole in established funds. It only selects probes: the
+    existing-pair filter still writes actual upstream NAVs, never invented
+    dates. Reuses the overseas-check scan, keeping request volume bounded.
+    """
+    first: Dict[str, date] = {}
+    for code, day in pairs:
+        if day <= end_date and (code not in first or day < first[code]):
+            first[code] = day
+    cutoff = end_date - timedelta(days=RECENT_REPORTING_DAYS)
+    return {code for code, day in first.items() if day >= cutoff}
+
 
 def _is_overseas(fund_name: Optional[str], fund_type: Optional[str]) -> bool:
     """QDII by type or name. Some QDII index funds are typed 指数型-海外股票."""
@@ -189,7 +210,7 @@ def _late_overseas_codes(
 def _get_missing_universe(
     catalog, end_date: date, start_date: date,
 ) -> pd.DataFrame:
-    """Funds with no fund_daily row ON end_date, plus late overseas funds.
+    """Target-day gaps, late overseas funds, and recently started/resumed NAVs.
 
     The gap is computed for the target day alone, while the FETCH window
     stays [start_date, end_date] — those are deliberately different spans.
@@ -244,14 +265,15 @@ def _get_missing_universe(
         fn_latest = fn_latest.assign(fund_type=None)
     gap = fn_latest[~fn_latest.fund_code.isin(covered)]
 
-    late = _late_overseas_codes(
-        fn_all,
-        _existing_pairs(catalog, end_date - timedelta(days=10), end_date),
-        end_date,
-    ) - set(gap.fund_code)
+    pairs = _existing_pairs(catalog, end_date - timedelta(days=10), end_date)
+    late = _late_overseas_codes(fn_all, pairs, end_date) - set(gap.fund_code)
     if late:
         logger.info(f"late overseas: re-checking {len(late)} QDII funds with recent holes")
         gap = pd.concat([gap, fn_all[fn_all.fund_code.isin(late)]])
+    recent = _recently_reporting_codes(pairs, end_date) - set(gap.fund_code)
+    if recent:
+        logger.info(f"recent reporting: re-checking {len(recent)} new/resumed funds")
+        gap = pd.concat([gap, fn_all[fn_all.fund_code.isin(recent)]])
     return gap[["fund_code", "fund_name", "fund_type"]].reset_index(drop=True)
 
 

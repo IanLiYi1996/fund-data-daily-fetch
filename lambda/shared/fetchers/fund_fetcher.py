@@ -1,5 +1,6 @@
 import math
 import re
+from datetime import date
 
 import akshare as ak
 import pandas as pd
@@ -24,6 +25,56 @@ def _normalize_sina_spot(df: pd.DataFrame) -> pd.DataFrame:
         r"^(sh|sz|bj)", "", regex=True,
     )
     return out
+
+
+_HK_RANK_FIELDS = {
+    "FCODE": "基金代码", "SHORTNAME": "基金简称", "CURRENCY": "币种",
+    "JZRQ": "日期", "NAV": "单位净值", "NAVCHGRT": "日增长率",
+    "W": "近1周", "M": "近1月", "Q": "近3月", "HY": "近6月",
+    "Y": "近1年", "TWY": "近2年", "TRY": "近3年",
+    "SY": "今年来", "SE": "成立来", "ISBUY": "可购买",
+    "HKFCODE": "香港基金代码",
+}
+
+
+def _normalize_hk_rank(rows: list[dict]) -> pd.DataFrame:
+    """Map HK JSON by key; its insertion order is not an API contract.
+
+    From 2026-10-27 AkShare's positional rename put CURRENCY in 基金代码
+    and Y in 币种. Raw parquet failed on Y's mixed floats/blank strings;
+    Iceberg still wrote, collapsing 191 funds into four currency keys.
+    Validate identifiers before either write, not just parquet dtypes.
+    """
+    columns = ["序号", *_HK_RANK_FIELDS.values()]
+    if not isinstance(rows, list):
+        raise ValueError("HK rankings Data must be a list")
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    required = {"FCODE", "SHORTNAME", "CURRENCY", "JZRQ", "NAV"}
+    for row in rows:
+        if not isinstance(row, dict) or not required.issubset(row):
+            missing = required - row.keys() if isinstance(row, dict) else required
+            raise ValueError(f"HK rankings missing fields: {sorted(missing)}")
+    out = pd.DataFrame(rows).reindex(columns=_HK_RANK_FIELDS).rename(
+        columns=_HK_RANK_FIELDS,
+    )
+    for source in ("FCODE", "SHORTNAME", "CURRENCY", "HKFCODE"):
+        col = _HK_RANK_FIELDS[source]
+        out[col] = out[col].astype("string")
+    if not out["基金代码"].str.fullmatch(r"\d{6}", na=False).all():
+        raise ValueError("HK rankings contain invalid fund code")
+    if out["基金代码"].duplicated().any():
+        raise ValueError("HK rankings contain duplicate fund codes")
+    out["日期"] = pd.to_datetime(out["日期"], errors="coerce").dt.date
+    for source in ("NAV", "NAVCHGRT", "W", "M", "Q", "HY", "Y",
+                   "TWY", "TRY", "SY", "SE"):
+        col = _HK_RANK_FIELDS[source]
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out["可购买"] = out["可购买"].map(
+        lambda value: "可购买" if str(value) == "1" else "不可购买",
+    )
+    out.insert(0, "序号", range(1, len(out) + 1))
+    return out[columns]
 
 
 # REIT quotes come from Sina hq, not ak.reits_realtime_em. That calls
@@ -447,8 +498,21 @@ class FundFetcher(BaseFetcher):
         return df
 
     def _fetch_fund_hk_rank(self):
-        df = ak.fund_hk_rank_em()
-        return df
+        today = date.today().isoformat()
+        response = requests.get(
+            "https://overseas.1234567.com.cn/overseasapi/OpenApiHander.ashx",
+            params={
+                "api": "HKFDApi", "m": "MethodFundList", "action": "1",
+                "pageindex": "0", "pagesize": "5000", "dy": "1",
+                "date1": today, "date2": today, "sortfield": "Y",
+                "sorttype": "-1", "isbuy": "0",
+            },
+            headers={"Referer": "https://fund.eastmoney.com/fundguzhi.html",
+                     "User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        return _normalize_hk_rank(response.json()["Data"])
 
     def _fetch_fund_rating(self):
         import pandas as pd
