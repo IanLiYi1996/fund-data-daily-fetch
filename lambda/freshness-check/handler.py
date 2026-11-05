@@ -601,6 +601,11 @@ def _check_workflow(problems: List[str], facts: List[str]) -> None:
                 break
             kwargs["nextToken"] = page["nextToken"]
         failed, missing = _fund_partition_outcomes(events)
+        fallback_error = _fund_fallback_outcome(events)
+        if fallback_error:
+            problems.append(
+                f"基金补采失败或未完成（工作流 `{status}`）: {fallback_error[:240]}"
+            )
         if failed:
             problems.append(
                 f"采集子任务失败 {len(failed)} 张表（工作流仍为 SUCCEEDED）: "
@@ -611,6 +616,57 @@ def _check_workflow(problems: List[str], facts: List[str]) -> None:
                 f"采集子任务超时、未返回结果 {len(missing)} 张表: "
                 + ", ".join(f"`{t}`" for t in missing)
             )
+
+
+def _fund_fallback_outcome(events: List[Dict[str, Any]]) -> Optional[str]:
+    """Inspect the critical fallback, including an error swallowed by Catch.
+
+    Partition success is not evidence that fallback succeeded. Read the
+    original task exit rather than only the catch's generic error message.
+    """
+    entered = False
+    outcome = None
+    for event in events:
+        if event.get("type") == "TaskStateEntered":
+            details = event.get("stateEnteredEventDetails") or {}
+            if details.get("name") == "InvokeFundFallback":
+                entered = True
+        if event.get("type") != "TaskStateExited":
+            continue
+        details = event.get("stateExitedEventDetails") or {}
+        if details.get("name") != "InvokeFundFallback":
+            continue
+        entered = True
+        try:
+            output = json.loads(details.get("output") or "{}")
+        except (TypeError, ValueError):
+            outcome = "Invalid fallback JSON response"
+            continue
+        if not isinstance(output, dict):
+            outcome = "Invalid fallback response"
+            continue
+        if isinstance(output.get("Payload"), dict):
+            output = output["Payload"]
+        if output.get("Error"):
+            outcome = f"{output['Error']}: {output.get('Cause', '')}"
+            continue
+        money = output.get("money_verify") or {}
+        if not isinstance(money, dict):
+            outcome = "Invalid money verification response"
+            continue
+        if (output.get("success") is not True
+                or output.get("complete") is False or output.get("errors")
+                or money.get("complete") is False or money.get("errors") or money.get("error")):
+            outcome = (
+                f"{output.get('error') or money.get('error') or 'partial/source failures'}; "
+                f"pending={output.get('pending', '?')}, errors={output.get('errors', 0)}, "
+                f"money_pending={money.get('pending', 0)}, money_errors={money.get('errors', 0)}"
+            )
+        else:
+            outcome = ""
+    if not entered:
+        return None  # Older executions without the fallback stage.
+    return outcome if outcome is not None else "补采任务没有返回结果"
 
 
 def _fund_partition_outcomes(

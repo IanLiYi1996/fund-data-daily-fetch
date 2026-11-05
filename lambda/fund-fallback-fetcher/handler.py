@@ -21,6 +21,9 @@ Idempotent: fund_daily is append-mode; weekly compaction dedups.
 from __future__ import annotations
 
 import os
+import json
+import math
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Optional
@@ -51,6 +54,78 @@ _HEADERS = {
 # lower this rather than accepting silent truncation, because a timeout
 # leaves the day partially filled with no error surfaced anywhere.
 FALLBACK_WORKERS = int(os.environ.get("FALLBACK_WORKERS", "24"))
+FALLBACK_BATCH_SIZE = int(os.environ.get("FALLBACK_BATCH_SIZE", "128"))
+# Includes time to finish in-flight HTTP requests and commit the current batch.
+COMMIT_RESERVE_SECONDS = 90
+MONEY_VERIFY_BUDGET_SECONDS = 120
+
+
+class _Budget:
+    def __init__(self, context=None, seconds=810):
+        self.context = context
+        self.deadline = time.monotonic() + seconds
+
+    def remaining(self):
+        left = self.deadline - time.monotonic()
+        if self.context is not None:
+            left = min(left, self.context.get_remaining_time_in_millis() / 1000
+                       - COMMIT_RESERVE_SECONDS)
+        return left
+
+    def expired(self):
+        return self.remaining() <= 0
+
+
+def _fetch_batches(items, start_date, end_date, budget):
+    """Bound outstanding work, cancel queued requests, and expose every batch.
+
+    Workers only read upstream. Always join running requests (bounded HTTP
+    timeouts) before yielding, so no background task survives Lambda return.
+    """
+    for offset in range(0, len(items), FALLBACK_BATCH_SIZE):
+        if budget is not None and budget.expired():
+            return
+        batch = items[offset:offset + FALLBACK_BATCH_SIZE]
+        results = []
+        with ThreadPoolExecutor(max_workers=FALLBACK_WORKERS) as ex:
+            futures = {ex.submit(_fetch_one, item, start_date, end_date): item
+                       for item in batch}
+            for future in as_completed(futures):
+                if budget is not None and budget.expired():
+                    for queued in futures:
+                        queued.cancel()
+                    break
+            # The context manager joins running requests. Collect even the
+            # ones that finished at the budget boundary; don't discard NAVs.
+        for future, item in futures.items():
+            if future.cancelled():
+                continue
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                results.append((item[0], None, f"{type(exc).__name__}: {exc}"))
+        yield results
+        if budget is not None and budget.expired():
+            return
+
+
+def _latest_fund_names(catalog):
+    """One bounded metadata snapshot shared by gap fill and money verification."""
+    table = catalog.load_table((DATABASE, "fund_name"))
+    fields = ("fund_code", "fund_name", "fund_type", "snapshot_date")
+    arrow = table.scan(
+        row_filter=GreaterThanOrEqual("snapshot_date", date.today() - timedelta(days=14)),
+        selected_fields=fields,
+    ).to_arrow()
+    if not arrow.num_rows:
+        # A long outage must not turn an empty recent scan into "zero gaps".
+        arrow = table.scan(selected_fields=fields).to_arrow()
+    if not arrow.num_rows:
+        raise ValueError("fund_name has no usable membership snapshot")
+    names = arrow.to_pandas()
+    return names[names.snapshot_date == names.snapshot_date.max()].drop_duplicates(
+        "fund_code", keep="last",
+    ).reset_index(drop=True)
 
 # 每万份收益 is quoted to 4 decimals, so anything past rounding is a real
 # disagreement. Set above 1e-4 to avoid rewriting rows over the last digit.
@@ -74,29 +149,40 @@ def _fetch_one(code_name, start_date: str, end_date: str):
             headers=_HEADERS,
             timeout=15,
         )
-        rows = r.json().get("Data", {}).get("LSJZList", []) or []
+        r.raise_for_status()
+        payload = r.json()
+        if payload.get("ErrCode") not in (None, 0, "0"):
+            raise ValueError(f"Upstream error {payload['ErrCode']}")
+        rows = (payload.get("Data") or {}).get("LSJZList", []) or []
     except Exception as e:
         return code, None, f"{type(e).__name__}: {str(e)[:60]}"
 
     if not rows:
         return code, None, "empty"
 
-    df = pd.DataFrame(rows)
-    df = df[df.FSRQ.notna() & (df.FSRQ != "")]
-    if df.empty:
-        return code, None, "empty"
-
-    df["fund_code"] = code
-    df["fund_name"] = name
-    df["trade_date"] = pd.to_datetime(df.FSRQ).dt.date
-    df["unit_nav"] = pd.to_numeric(df.DWJZ, errors="coerce")
-    df["accum_nav"] = pd.to_numeric(df.LJJZ, errors="coerce")
-    df["daily_return_pct"] = pd.to_numeric(df.JZZZL, errors="coerce")
-    df["subscription_status"] = df.SGZT
-    df["redemption_status"] = df.SHZT
-    df = df[df.unit_nav.notna()]
-    if df.empty:
-        return code, None, "no-nav"
+    try:
+        df = pd.DataFrame(rows)
+        df = df[df.FSRQ.notna() & (df.FSRQ != "")].copy()
+        if df.empty:
+            return code, None, "empty"
+        df["fund_code"] = code
+        df["fund_name"] = name
+        df["trade_date"] = pd.to_datetime(df.FSRQ).dt.date
+        lo, hi = date.fromisoformat(start_date), date.fromisoformat(end_date)
+        if not df.trade_date.between(lo, hi).all():
+            raise ValueError("Upstream returned dates outside the requested window")
+        df["unit_nav"] = pd.to_numeric(df.DWJZ, errors="coerce")
+        if any(not math.isfinite(float(v)) for v in df.unit_nav.dropna()):
+            raise ValueError("Upstream returned a non-finite NAV")
+        df["accum_nav"] = pd.to_numeric(df.LJJZ, errors="coerce")
+        df["daily_return_pct"] = pd.to_numeric(df.JZZZL, errors="coerce")
+        df["subscription_status"] = df.SGZT
+        df["redemption_status"] = df.SHZT
+        df = df[df.unit_nav.notna()]
+        if df.empty:
+            return code, None, "no-nav"
+    except Exception as exc:
+        return code, None, f"{type(exc).__name__}: {str(exc)[:100]}"
 
     return code, df[[
         "fund_code", "fund_name", "trade_date", "unit_nav", "accum_nav",
@@ -208,7 +294,7 @@ def _late_overseas_codes(
 
 
 def _get_missing_universe(
-    catalog, end_date: date, start_date: date,
+    catalog, end_date: date, start_date: date, *, names=None, existing=None,
 ) -> pd.DataFrame:
     """Target-day gaps, late overseas funds, and recently started/resumed NAVs.
 
@@ -223,12 +309,7 @@ def _get_missing_universe(
     from 2026-08-03 — Iceberg went from 26.3k to 23.8k codes per day
     while the fetch window still looked healthy.
     """
-    name_tbl = catalog.load_table((DATABASE, "fund_name"))
-    fn = name_tbl.scan().to_arrow().to_pandas()
-    latest = fn.snapshot_date.max()
-    fn_latest = (
-        fn[fn.snapshot_date == latest].drop_duplicates("fund_code").reset_index(drop=True)
-    )
+    fn_latest = _latest_fund_names(catalog) if names is None else names.copy()
     # Full universe for the late-overseas check, before weekend scoping.
     fn_all = (fn_latest if "fund_type" in fn_latest.columns
               else fn_latest.assign(fund_type=None))
@@ -248,24 +329,28 @@ def _get_missing_universe(
     # e.g. 010866 sat at NULL for a week while lsjz had 1.0107..1.0090 the
     # whole time.
     daily_tbl = catalog.load_table((DATABASE, "fund_daily"))
-    covered_arrow = daily_tbl.scan(
-        row_filter=And(
-            GreaterThanOrEqual("trade_date", end_date),
-            LessThanOrEqual("trade_date", end_date),
-        ),
-        selected_fields=("fund_code", "unit_nav"),
-    ).to_arrow()
-    covered = {
-        c for c, v in zip(covered_arrow["fund_code"].to_pylist(),
-                          covered_arrow["unit_nav"].to_pylist())
-        if v is not None
-    }
+    if existing is None:
+        covered_arrow = daily_tbl.scan(
+            row_filter=And(
+                GreaterThanOrEqual("trade_date", end_date),
+                LessThanOrEqual("trade_date", end_date),
+            ),
+            selected_fields=("fund_code", "unit_nav"),
+        ).to_arrow()
+        covered = {
+            c for c, v in zip(covered_arrow["fund_code"].to_pylist(),
+                              covered_arrow["unit_nav"].to_pylist()) if v is not None
+        }
+    else:
+        covered = {code for code, day in existing if day == end_date}
 
     if "fund_type" not in fn_latest.columns:
         fn_latest = fn_latest.assign(fund_type=None)
     gap = fn_latest[~fn_latest.fund_code.isin(covered)]
 
-    pairs = _existing_pairs(catalog, end_date - timedelta(days=10), end_date)
+    pairs = (_existing_pairs(catalog, end_date - timedelta(days=10), end_date)
+             if existing is None else
+             {(c, d) for c, d in existing if d >= end_date - timedelta(days=10)})
     late = _late_overseas_codes(fn_all, pairs, end_date) - set(gap.fund_code)
     if late:
         logger.info(f"late overseas: re-checking {len(late)} QDII funds with recent holes")
@@ -301,7 +386,7 @@ def _existing_pairs(catalog, start_date: date, end_date: date) -> set:
 
 
 def _verify_money_funds(
-    catalog, target: date, writer: "IcebergWriter",
+    catalog, target: date, writer: "IcebergWriter", *, names=None, budget=None,
 ) -> Dict[str, Any]:
     """Re-assert money-market NAVs from lsjz, writing only where we disagree.
 
@@ -323,14 +408,12 @@ def _verify_money_funds(
     ingested_at tiebreak then makes the new row authoritative in both the export
     and weekly compaction, so no delete is required.
     """
-    name_tbl = catalog.load_table((DATABASE, "fund_name"))
-    fn = name_tbl.scan().to_arrow().to_pandas()
-    fn = fn[fn.snapshot_date == fn.snapshot_date.max()].drop_duplicates("fund_code")
+    fn = _latest_fund_names(catalog) if names is None else names
     if "fund_type" not in fn.columns:
-        return {"checked": 0, "corrected": 0}
+        return {"checked": 0, "corrected": 0, "complete": True, "errors": 0}
     money = fn[fn.fund_type.fillna("").str.startswith("货币型")]
     if money.empty:
-        return {"checked": 0, "corrected": 0}
+        return {"checked": 0, "corrected": 0, "complete": True, "errors": 0}
 
     # Check a WINDOW, not just the target day. The snapshot endpoint returns
     # today AND yesterday, so the run on day D rewrites day D-1 — and it
@@ -354,7 +437,7 @@ def _verify_money_funds(
     ).to_arrow().to_pandas()
     held = held[held.unit_nav.notna()]
     if held.empty:
-        return {"checked": 0, "corrected": 0}
+        return {"checked": 0, "corrected": 0, "complete": True, "errors": 0}
     # Compare against the row the consumer actually gets — newest write per
     # (code, date) — or a stale duplicate would look like a live discrepancy
     # and get "corrected" on every single run.
@@ -369,49 +452,42 @@ def _verify_money_funds(
         (c, n) for c, n in zip(money.fund_code, money.fund_name)
         if c in money_codes
     ]
-    frames: list[pd.DataFrame] = []
-    with ThreadPoolExecutor(max_workers=FALLBACK_WORKERS) as ex:
-        futs = {
-            ex.submit(
-                _fetch_one, it, window_start.isoformat(), target.isoformat(),
-            ): it
-            for it in items
-        }
-        for fut in as_completed(futs):
-            code, df, _err = fut.result()
+    checked = corrected = errors = 0
+    codes = []
+    for results in _fetch_batches(
+        items, window_start.isoformat(), target.isoformat(), budget,
+    ):
+        frames = []
+        for code, df, err in results:
+            checked += 1
+            if err and err not in ("empty", "no-nav"):
+                errors += 1
             if df is None or df.empty:
                 continue
-            bad = df[df.apply(
-                lambda r: (
-                    (code, r.trade_date) in ours
-                    and r.unit_nav is not None
-                    and not pd.isna(r.unit_nav)
-                    and abs(float(r.unit_nav)
-                            - float(ours[(code, r.trade_date)]))
+            mask = [
+                (code, day) in ours and not pd.isna(nav)
+                and abs(float(nav) - float(ours[(code, day)]))
                     > MONEY_NAV_TOLERANCE
-                ),
-                axis=1,
-            )] if not df.empty else df
+                for day, nav in zip(df.trade_date, df.unit_nav)
+            ]
+            bad = df[mask]
             if not bad.empty:
                 frames.append(bad)
-
-    if not frames:
-        return {"checked": len(items), "corrected": 0}
-
-    merged = pd.concat(frames, ignore_index=True)
-    writer.write("fund_daily", merged, fetch_date=target)
-    logger.info(
-        f"money verify: corrected {len(merged)} rows over "
-        f"{window_start}..{target} across {len(items)} funds: "
-        + ", ".join(f"{r.fund_code}@{r.trade_date}"
-                    for _, r in merged.head(10).iterrows())
-    )
+        if frames:
+            merged = pd.concat(frames, ignore_index=True)
+            _commit(writer, merged, target)
+            corrected += len(merged)
+            for row in merged.itertuples():
+                ours[(row.fund_code, row.trade_date)] = row.unit_nav
+                if len(codes) < 20:
+                    codes.append(f"{row.fund_code}@{row.trade_date}")
+        logger.info(f"money verify checkpoint: {checked}/{len(items)} checked, "
+                    f"{corrected} corrected, {errors} errors")
     return {
-        "checked": len(items),
+        "checked": checked, "complete": checked == len(items),
+        "pending": len(items) - checked, "errors": errors,
         "window": f"{window_start}..{target}",
-        "corrected": int(len(merged)),
-        "codes": [f"{r.fund_code}@{r.trade_date}"
-                  for _, r in merged.head(20).iterrows()],
+        "corrected": corrected, "codes": codes,
     }
 
 
@@ -433,152 +509,120 @@ def _latest_loaded_date(catalog) -> Optional[date]:
     return max(days) if days else None
 
 
-def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    started = datetime.utcnow()
+def _commit(writer, frame, target):
+    result = writer.write("fund_daily", frame, fetch_date=target)
+    if not isinstance(result, dict) or result.get("error"):
+        raise RuntimeError((result or {}).get("error", "Invalid writer response"))
+    written = result.get("rows_appended", result.get("rows_inserted", 0))
+    if written != len(frame):
+        raise RuntimeError(f"Partial commit: expected {len(frame)}, wrote {written}")
+    return written
 
-    catalog = load_catalog("glue", **{
-        "type": "glue", "glue.region": REGION, "warehouse": WAREHOUSE,
-    })
 
-    end_date_str = event.get("trade_date")
-    if end_date_str:
-        end_date = date.fromisoformat(end_date_str)
-    else:
-        end_date = _latest_loaded_date(catalog) or date.today()
-    # 3 days was too tight. Periodic-open funds (3/6-month-hold FOF, some
-    # 定开债) disclose on their own cadence, so a fund whose latest NAV is
-    # 10 days old still counts as "missing" every single day while the
-    # window never reaches its disclosure date. Measured on the 2026-08-03
-    # gap of 714 codes: 36 of them (34 FOF + 2 定开债) were sitting in
-    # lsjz the whole time, just outside a 3-day window. 14 days covers a
-    # quarterly-hold fund's gap between disclosures without pulling so
-    # much history that the run slows down.
-    lookback = int(event.get("lookback_days", os.environ.get("FALLBACK_LOOKBACK_DAYS", "14")))
-    start_date = end_date - timedelta(days=lookback)
-
-    logger.info(
-        f"Fallback fetch: target {end_date.isoformat()} / "
-        f"fetch window {start_date.isoformat()} → {end_date.isoformat()}"
-    )
-
-    writer = IcebergWriter(
-        database=DATABASE, warehouse=WAREHOUSE, subprocess_mode=False,
-    )
-
-    # Runs before the gap fill and on every exit path: a day can have no gaps
-    # at all and still hold a wrong money-market value, because that defect is
-    # about the VALUE the snapshot endpoint reported, not about a missing row.
-    # Best-effort — a failure here must not cost the gap fill.
-    money: Dict[str, Any] = {"checked": 0, "corrected": 0}
-    if VERIFY_MONEY_FUNDS:
-        try:
-            money = _verify_money_funds(catalog, end_date, writer)
-        except Exception as e:
-            logger.warning(f"money verify failed: {type(e).__name__}: {e}")
-            money = {"checked": 0, "corrected": 0, "error": f"{type(e).__name__}"}
-
-    missing = _get_missing_universe(catalog, end_date, start_date)
-    logger.info(f"Missing funds in window: {len(missing):,}")
-
-    if missing.empty:
-        return {
-            "statusCode": 200,
-            "downloader": "fund-fallback",
-            "success": True,
-            "missing": 0,
-            "fetched": 0,
-            "rows_appended": 0,
-            "money_verify": money,
-            "elapsed_seconds": (datetime.utcnow() - started).total_seconds(),
-        }
-
+def _fill_gaps(missing, existing, writer, start, end, budget, summary):
+    reits = set(missing.fund_code[missing.fund_type.map(_is_public_reit)])
     items = list(zip(missing.fund_code, missing.fund_name))
-    frames: list[pd.DataFrame] = []
-    empty = err = 0
-
-    with ThreadPoolExecutor(max_workers=FALLBACK_WORKERS) as ex:
-        futs = {
-            ex.submit(
-                _fetch_one, it, start_date.isoformat(), end_date.isoformat()
-            ): it
-            for it in items
-        }
-        for fut in as_completed(futs):
-            code, df, error = fut.result()
-            if df is None or df.empty:
-                if error and not error.startswith("empty"):
-                    err += 1
+    recovered = set()
+    for results in _fetch_batches(items, start.isoformat(), end.isoformat(), budget):
+        frames = []
+        for code, frame, error in results:
+            summary["attempted"] += 1
+            if frame is None or frame.empty:
+                if error not in (None, "empty", "no-nav"):
+                    summary["errors"] += 1
                 else:
-                    empty += 1
+                    summary["empty"] += 1
                 continue
-            frames.append(df)
+            frames.append(frame)
+        if frames:
+            merged = pd.concat(frames, ignore_index=True).drop_duplicates(
+                ["fund_code", "trade_date"], keep="last",
+            )
+            merged = merged[[(c, d) not in existing
+                             for c, d in zip(merged.fund_code, merged.trade_date)]]
+            before = len(merged)
+            merged = _quarantine_reit_rows(merged, reits, end)
+            summary["quarantined_reit_rows"] += before - len(merged)
+            if not merged.empty:
+                # Commit before the next HTTP batch. No uncommitted day's
+                # worth of NAVs can be lost if a later batch times out.
+                written = _commit(writer, merged, end)
+                summary["rows_appended"] += written
+                existing.update(zip(merged.fund_code, merged.trade_date))
+                recovered.update(merged.fund_code)
+        summary["fetched"] = len(recovered)
+        summary["pending"] = len(items) - summary["attempted"]
+        logger.info(f"Fallback checkpoint: {summary['attempted']}/{len(items)} "
+                    f"probed, {summary['rows_appended']} rows committed, "
+                    f"{summary['errors']} errors, "
+                    f"{max(0, budget.remaining()):.0f}s budget left")
 
-    if not frames:
-        logger.info(f"No fallback data recovered. empty={empty} err={err}")
-        return {
-            "statusCode": 200,
-            "downloader": "fund-fallback",
-            "success": True,
-            "missing": len(missing),
-            "fetched": 0,
-            "rows_appended": 0,
-            "money_verify": money,
-            "elapsed_seconds": (datetime.utcnow() - started).total_seconds(),
-        }
 
-    merged = pd.concat(frames, ignore_index=True)
-
-    # Write only rows we don't already hold. The fetch window spans 14 days so
-    # hold-period products' disclosure dates fall inside it, but appending the
-    # whole window every day duplicated rows we already had: fund_daily is
-    # append-mode, so by 2026-08-07 the table carried 71,889 rows for 25,649
-    # funds — nearly 3x — and 319,234 duplicates overall. Weekly compaction
-    # dedups, but daily accumulation outpaced it.
-    #
-    # Keep the target day plus any earlier date genuinely missing a NAV, so
-    # periodic-open funds still get backfilled the first time we see their
-    # disclosure.
-    existing = _existing_pairs(catalog, start_date, end_date)
-    before = len(merged)
-    merged = merged[
-        ~merged.apply(
-            lambda r: (r.fund_code, r.trade_date) in existing, axis=1
-        )
-    ]
-    # REIT rows dated today wait a day before we trust them (see the helper).
-    reit_codes = set(missing.fund_code[missing.fund_type.map(_is_public_reit)])
-    after_existing = len(merged)
-    merged = _quarantine_reit_rows(merged, reit_codes, end_date)
-    quarantined = after_existing - len(merged)
-    logger.info(
-        f"Recovered {merged.fund_code.nunique():,} funds, {len(merged):,} rows "
-        f"(dropped {before - after_existing:,} already present, "
-        f"quarantined {quarantined} same-day REIT rows)"
-    )
-    if merged.empty:
-        return {
-            "statusCode": 200,
-            "downloader": "fund-fallback",
-            "success": True,
-            "missing": len(missing),
-            "fetched": 0,
-            "rows_appended": 0,
-            "money_verify": money,
-            "elapsed_seconds": (datetime.utcnow() - started).total_seconds(),
-        }
-
-    result = writer.write("fund_daily", merged, fetch_date=end_date)
-
-    return {
-        "statusCode": 200,
-        "downloader": "fund-fallback",
-        "success": True,
-        "missing": len(missing),
-        "fetched": int(merged.fund_code.nunique()),
-        "rows_appended": int(result.get("rows_appended", result.get("rows_inserted", 0))),
-        "quarantined_reit_rows": int(quarantined),
-        "empty": empty,
-        "errors": err,
-        "money_verify": money,
-        "elapsed_seconds": (datetime.utcnow() - started).total_seconds(),
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    started = time.monotonic()
+    budget = _Budget(context)
+    out = {
+        "statusCode": 200, "downloader": "fund-fallback", "success": False,
+        "complete": False, "missing": 0, "attempted": 0, "pending": 0,
+        "fetched": 0, "rows_appended": 0, "errors": 0, "empty": 0,
+        "quarantined_reit_rows": 0,
+        "money_verify": {"checked": 0, "corrected": 0, "complete": True, "errors": 0},
     }
+    try:
+        if budget.expired():
+            raise RuntimeError("Insufficient remaining time to start fallback")
+        catalog = load_catalog("glue", **{
+            "type": "glue", "glue.region": REGION, "warehouse": WAREHOUSE,
+        })
+        end = (date.fromisoformat(event["trade_date"]) if event.get("trade_date")
+               else _latest_loaded_date(catalog) or date.today())
+        lookback = int(event.get(
+            "lookback_days", os.environ.get("FALLBACK_LOOKBACK_DAYS", "14"),
+        ))
+        if not 1 <= lookback <= 31:
+            raise ValueError("lookback_days must be between 1 and 31")
+        start = end - timedelta(days=lookback)
+        out["target_date"] = str(end)
+        logger.info(f"Fallback fetch: target {end} / fetch window {start} → {end}")
+        names = _latest_fund_names(catalog)
+        existing = _existing_pairs(catalog, start, end)
+        missing = _get_missing_universe(
+            catalog, end, start, names=names, existing=existing,
+        )
+        # The observed incident is a FOF cohort loss; service this known
+        # slow-settling population before lower-priority empty probes.
+        priority = missing.fund_type.fillna("").str.startswith("FOF")
+        missing = pd.concat([missing[priority], missing[~priority]]).reset_index(drop=True)
+        out["missing"] = out["pending"] = len(missing)
+        logger.info(f"Fallback prepared in {time.monotonic() - started:.1f}s; "
+                    f"missing={len(missing)}, FOF={int(priority.sum())}")
+        writer = IcebergWriter(
+            catalog=catalog, database=DATABASE, warehouse=WAREHOUSE, subprocess_mode=False,
+        )
+        _fill_gaps(missing, existing, writer, start, end, budget, out)
+        gap_complete = out["pending"] == 0
+        if VERIFY_MONEY_FUNDS and event.get("verify_money_funds", True):
+            if not gap_complete or budget.expired():
+                out["money_verify"] = {
+                    "checked": 0, "corrected": 0, "complete": False,
+                    "error": "Skipped: gap fill incomplete or budget exhausted",
+                }
+            else:
+                money_budget = _Budget(
+                    context, min(MONEY_VERIFY_BUDGET_SECONDS, budget.remaining()),
+                )
+                out["money_verify"] = _verify_money_funds(
+                    catalog, end, writer, names=names, budget=money_budget,
+                )
+        out["complete"] = gap_complete and out["money_verify"].get("complete", True)
+        out["success"] = bool(out["complete"] and not out["errors"]
+                              and not out["money_verify"].get("errors", 0)
+                              and not out["money_verify"].get("error"))
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        # Previously committed batches survive a failed later commit.
+        out["success"] = out["complete"] = False
+        logger.exception("Fallback failed after committed checkpoints")
+    out["elapsed_seconds"] = round(time.monotonic() - started, 2)
+    logger.info("Fallback summary: %s", json.dumps(out, ensure_ascii=False))
+    return out
