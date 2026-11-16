@@ -32,7 +32,7 @@ def quarter_end(year: int, quarter: int) -> date:
 
 def _number(text: str, *, percent: bool = False):
     value = text.strip().replace(",", "")
-    if value in ("", "-", "--", "—"):
+    if value in ("", "-", "--", "---", "—"):
         return None
     if percent:
         value = value.removesuffix("%")
@@ -46,6 +46,7 @@ def _number(text: str, *, percent: bool = False):
 
 def parse_holdings(
     text: str, code: str, year: int, *, as_of: date | None = None,
+    target_quarter: date | None = None,
 ) -> pd.DataFrame:
     match = _WRAPPER.fullmatch(text)
     if not match:
@@ -63,6 +64,7 @@ def parse_holdings(
             return pd.DataFrame(columns=FIELDS)
         raise ValueError("holdings response has no quarterly disclosure")
     rows = []
+    observation_cutoffs = {}
     for heading in headings:
         title = heading.get_text(" ", strip=True)
         quarter = _QUARTER.search(title)
@@ -73,9 +75,18 @@ def parse_holdings(
             raise ValueError("holding disclosure year differs from request")
         if report_date > (as_of or date.today()):
             continue
+        if target_quarter is not None and report_date != target_quarter:
+            continue
         cutoff = re.search(r"截止至[：:]\s*(\d{4}-\d{2}-\d{2})", title)
-        if cutoff and cutoff[1] != report_date.isoformat():
-            raise ValueError("holding cutoff differs from quarter")
+        if cutoff:
+            observed = date.fromisoformat(cutoff[1])
+            if (observed.year, (observed.month - 1) // 3) != (
+                report_date.year, (report_date.month - 1) // 3,
+            ) or observed > (as_of or date.today()):
+                raise ValueError("holding cutoff differs from quarter")
+            # report_date identifies the disclosure period, not the actual
+            # observation day. Retain that day as parser provenance.
+            observation_cutoffs[report_date.isoformat()] = observed.isoformat()
         table = heading.parent.find("table")
         if table is None:
             raise ValueError("holding disclosure has no table")
@@ -106,10 +117,13 @@ def parse_holdings(
         if frame.drop_duplicates().duplicated(keys).any():
             raise ValueError("conflicting duplicate holding rows")
         frame = frame.drop_duplicates(keys)
+    frame.attrs["observation_cutoffs"] = observation_cutoffs
     return frame
 
 
-def fetch_holdings(code: str, year: int, *, get=None) -> pd.DataFrame:
+def fetch_holdings(
+    code: str, year: int, *, get=None, target_quarter: date | None = None,
+) -> pd.DataFrame:
     if not re.fullmatch(r"\d{6}", code):
         raise ValueError("invalid fund code")
     response = (get or requests.get)(
@@ -122,7 +136,7 @@ def fetch_holdings(code: str, year: int, *, get=None) -> pd.DataFrame:
             "User-Agent": "Mozilla/5.0",
             "Referer": f"https://fundf10.eastmoney.com/ccmx_{code}.html",
         },
-        timeout=(5, 30),
+        timeout=(20, 45),
     )
     response.raise_for_status()
-    return parse_holdings(response.text, code, year)
+    return parse_holdings(response.text, code, year, target_quarter=target_quarter)

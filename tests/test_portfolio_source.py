@@ -34,7 +34,7 @@ def test_fetch_checks_status_and_supplies_referer():
     assert not frame.empty
     response.raise_for_status.assert_called_once()
     assert get.call_args.kwargs["headers"]["Referer"].endswith("ccmx_000001.html")
-    assert get.call_args.kwargs["timeout"] == (5, 30)
+    assert get.call_args.kwargs["timeout"] == (20, 45)
 
 
 @pytest.mark.parametrize("body", ["<html>404</html>", "var apidata={content:'bad'};"])
@@ -60,3 +60,44 @@ def test_missing_required_column_is_an_error():
     from shared.quality.portfolio_hold import parse_holdings
     with pytest.raises(ValueError, match="column"):
         parse_holdings(_response().replace("股票代码", "未知字段"), "000001", 2026)
+
+
+def test_within_quarter_cutoff_preserves_report_period_and_observation_date():
+    from shared.quality.portfolio_hold import parse_holdings
+    frame = parse_holdings(
+        _response().replace("2026-09-30", "2026-09-29"), "001884", 2026,
+        as_of=date(2026, 11, 16), target_quarter=date(2026, 9, 30),
+    )
+    assert frame.iloc[0].report_date == date(2026, 9, 30)
+    assert frame.attrs["observation_cutoffs"] == {"2026-09-30": "2026-09-29"}
+
+
+@pytest.mark.parametrize("cutoff", ["2026-06-30", "2026-10-01", "2026-09-31"])
+def test_cross_quarter_or_invalid_cutoff_is_not_relaxed(cutoff):
+    from shared.quality.portfolio_hold import parse_holdings
+    with pytest.raises(ValueError):
+        parse_holdings(_response().replace("2026-09-30", cutoff), "000001", 2026)
+
+
+def test_target_only_skips_unrelated_broken_disclosure_before_parsing():
+    from shared.quality.portfolio_hold import parse_holdings
+    older = (
+        "<div><h4 class='t'>2026年2季度 截止至：2026-05-09</h4>"
+        "<table><thead><tr><th>other</th></tr></thead></table></div>"
+    )
+    body = _response().replace('</div>",', f'</div>{older}",')
+    frame = parse_holdings(
+        body, "159011", 2026, target_quarter=date(2026, 9, 30),
+        as_of=date(2026, 11, 16),
+    )
+    assert len(frame) == 1
+    assert set(frame.report_date) == {date(2026, 9, 30)}
+
+
+def test_disclosed_triple_dash_is_null_not_zero():
+    from shared.quality.portfolio_hold import parse_holdings
+    frame = parse_holdings(
+        _response().replace("1,234.56", "---"), "010992", 2026,
+        target_quarter=date(2026, 9, 30),
+    )
+    assert frame.iloc[0].market_value is None

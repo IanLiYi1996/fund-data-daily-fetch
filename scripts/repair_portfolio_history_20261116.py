@@ -22,6 +22,10 @@ RULE = "FundPortfolioHoldQuarterlySchedule"
 CLUSTER = "fund-data-backfill-cluster"
 REPAIR = PREFIX + "_repairs/2026-11-16-portfolio-history/"
 REPOSITORY = f"cdk-hnb659fds-container-assets-{ACCOUNT}-{REGION}"
+UNFINISHED_ETFS = {
+    "158036", "158043", "158052", "158055", "158062",
+    "158066", "158067", "158072", "159047",
+}
 
 
 def _ecs_network_configuration(target):
@@ -58,6 +62,30 @@ def _assert_scheduler_permission(session, target, task_definition):
     raise RuntimeError("scheduler lacks the explicitly scoped task grant; IAM confirmation required")
 
 
+def _assert_consumer_version_read(session, task):
+    """Fail before launching an export if its pinned baseline is unreadable."""
+    role = task["taskRoleArn"].rsplit("/", 1)[1]
+    iam = session.client("iam")
+    resource = f"arn:aws:s3:::{BUCKET}/{KEY}"
+    for name in iam.list_role_policies(RoleName=role)["PolicyNames"]:
+        document = iam.get_role_policy(RoleName=role, PolicyName=name)["PolicyDocument"]
+        for statement in document["Statement"]:
+            actions = statement.get("Action", [])
+            resources = statement.get("Resource", [])
+            if isinstance(actions, str):
+                actions = [actions]
+            if isinstance(resources, str):
+                resources = [resources]
+            if (
+                statement.get("Effect") == "Allow"
+                and actions == ["s3:GetObjectVersion"]
+                and resources == [resource]
+                and not statement.get("Condition")
+            ):
+                return
+    raise RuntimeError("task lacks the approved one-file version read grant; IAM confirmation required")
+
+
 def _quarantine_unfinished_quarter(session, state):
     """Isolate exactly the 90 legacy ETF rows stamped with an unfinished Q4."""
     import pyarrow.parquet as pq
@@ -80,7 +108,8 @@ def _quarantine_unfinished_quarter(session, state):
         raise RuntimeError("portfolio snapshot changed before quarantine")
     future = table.scan(row_filter=GreaterThan("report_date", date.today())).to_arrow()
     dates = set(future.column("report_date").to_pylist())
-    if len(future) != 90 or dates != {unfinished}:
+    codes = set(future.column("fund_code").to_pylist())
+    if len(future) != 90 or dates != {unfinished} or codes != UNFINISHED_ETFS:
         raise RuntimeError("unfinished-quarter rows differ from the inspected 90-row scope")
     s3 = session.client("s3")
     body = io.BytesIO()
@@ -150,12 +179,20 @@ def inspect_state(session):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", action="store_true")
-    parser.add_argument("--phase", choices=("prepare", "canary", "full", "export", "deploy", "quarantine-future"), default="prepare")
+    parser.add_argument("--phase", choices=("prepare", "canary", "full", "retry", "refresh-legacy", "export", "deploy", "quarantine-future"), default="prepare")
     parser.add_argument("--image", help="Immutable ECR image URI ending in @sha256:...")
     parser.add_argument("--task-definition")
     parser.add_argument("--expected-snapshot", type=int)
     parser.add_argument("--expected-version")
+    parser.add_argument("--failure-plan", help="Audited S3 code/error map, required for retry")
+    parser.add_argument("--workers", type=int, default=4)
     args = parser.parse_args()
+    if not 1 <= args.workers <= 4:
+        parser.error("incident repair uses 1..4 workers")
+    if (args.phase in ("retry", "refresh-legacy")) != bool(args.failure_plan):
+        parser.error("failure-plan is required for retry/refresh-legacy and not accepted for other phases")
+    if args.failure_plan and not args.failure_plan.startswith(f"s3://{BUCKET}/{REPAIR}"):
+        parser.error("failure-plan must be inside this incident's private repair prefix")
     session = boto3.Session(region_name=REGION)
     state = inspect_state(session)
     print(json.dumps({
@@ -230,6 +267,8 @@ def main():
     )["taskDefinition"]
     if task["containerDefinitions"][0]["image"] != args.image:
         raise RuntimeError("repair task definition/image mismatch")
+    if args.phase in ("full", "export", "deploy"):
+        _assert_consumer_version_read(session, task)
     if args.phase == "deploy":
         events = session.client("events")
         rule = state["rule"].copy()
@@ -238,6 +277,9 @@ def main():
         target = state["target"]
         _assert_scheduler_permission(session, target, args.task_definition)
         target["EcsParameters"]["TaskDefinitionArn"] = args.task_definition
+        target["Input"] = json.dumps({"containerOverrides": [{
+            "name": "backfill", "command": ["--mode", "portfolio", "--refresh-existing"],
+        }]})
         events.put_rule(**rule)
         result = events.put_targets(Rule=RULE, Targets=[target])
         if result["FailedEntryCount"]:
@@ -246,9 +288,14 @@ def main():
         return
     command = ["--mode", "portfolio", "--target-quarter", "2026-Q3", "--years", "2026"]
     if args.phase == "canary":
-        command += ["--limit", "100", "--workers", "8", "--batch", "100", "--no-export"]
+        command += ["--limit", "100", "--workers", str(args.workers), "--batch", "100", "--no-export"]
     elif args.phase == "full":
-        command += ["--workers", "16", "--batch", "200"]
+        command += ["--workers", str(args.workers), "--batch", "200"]
+    elif args.phase in ("retry", "refresh-legacy"):
+        command += ["--workers", str(args.workers), "--batch", "100",
+                    "--failure-plan", args.failure_plan, "--no-export"]
+        if args.phase == "refresh-legacy":
+            command += ["--refresh-existing"]
     else:
         command += ["--export-only"]
     target = state["target"]

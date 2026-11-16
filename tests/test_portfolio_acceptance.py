@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from unittest.mock import Mock
 
 
 @pytest.fixture
@@ -46,3 +47,25 @@ def test_acceptance_rejects_future_dates(acceptance):
     new.loc[1, "report_date"] = date(2026, 12, 31)
     with pytest.raises(AssertionError, match="completed Q3"):
         module.verify_frames(old, new)
+
+
+def test_reference_retries_transient_empty_without_changing_sample(acceptance, monkeypatch):
+    module, old, new = acceptance
+    fetch = Mock(side_effect=[old.iloc[:0], new.iloc[1:]])
+    sleep = Mock()
+    monkeypatch.setattr(module, "fetch_holdings", fetch)
+    monkeypatch.setattr(module.time, "sleep", sleep)
+    frame = module.read_reference("000001")
+    assert len(frame) == 1
+    assert fetch.call_count == 2
+    assert all(call.args == ("000001", 2026) for call in fetch.call_args_list)
+    sleep.assert_called_once_with(5)
+
+
+def test_reference_permanent_empty_is_not_fabricated(acceptance, monkeypatch):
+    module, old, _ = acceptance
+    fetch = Mock(return_value=old.iloc[:0])
+    monkeypatch.setattr(module, "fetch_holdings", fetch)
+    monkeypatch.setattr(module.time, "sleep", Mock())
+    assert module.read_reference("000001").empty
+    assert fetch.call_count == 3

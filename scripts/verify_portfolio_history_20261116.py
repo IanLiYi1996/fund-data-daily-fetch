@@ -7,6 +7,7 @@ import io
 import json
 import math
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
@@ -27,6 +28,14 @@ BACKUP = (
 KEYS = ["fund_code", "report_date", "holding_code"]
 VALUES = ["holding_name", "weight_pct", "shares", "market_value"]
 TARGET = date(2026, 9, 30)
+
+
+def read_reference(code):
+    for attempt in range(3):
+        frame = fetch_holdings(code, 2026, target_quarter=TARGET)
+        if not frame.empty or attempt == 2:
+            return frame
+        time.sleep(5 * (attempt + 1))
 
 
 def verify_frames(before, after):
@@ -79,7 +88,7 @@ def main():
     )[:args.sample]
 
     def compare(code):
-        upstream = fetch_holdings(code, 2026)
+        upstream = read_reference(code)
         upstream = upstream[upstream.report_date.eq(TARGET)]
         exported = target[target.fund_code.eq(code)]
         if set(upstream.holding_code) != set(exported.holding_code):

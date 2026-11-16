@@ -1226,6 +1226,20 @@ export class FundDataFetchStack extends Stack {
     [listBucketPolicy, objectPolicy, icebergGluePolicy].forEach((stmt) =>
       backfillTaskDef.taskRole.addToPrincipalPolicy(stmt)
     );
+    // Preserve the explicitly approved live inline-policy name. Only the
+    // portfolio baseline needs version reads; do not widen the S3 wildcard.
+    new iam.Policy(this, "PortfolioConsumerVersionRead", {
+      policyName: "PortfolioConsumerVersionRead",
+      roles: [backfillTaskDef.taskRole],
+      statements: [
+        new iam.PolicyStatement({
+          actions: ["s3:GetObjectVersion"],
+          resources: [
+            `arn:aws:s3:::${bucketName}/${s3Prefix}fund/_history/fund_portfolio_hold_history.parquet`,
+          ],
+        }),
+      ],
+    });
     backfillTaskDef.node.addDependency(glueDatabase);
 
     // Refresh top holdings after the quarterly disclosure window, not on
@@ -1255,7 +1269,7 @@ export class FundDataFetchStack extends Stack {
         containerOverrides: [
           {
             containerName: "backfill",
-            command: ["--mode", "portfolio"],
+            command: ["--mode", "portfolio", "--refresh-existing"],
           },
         ],
       })
