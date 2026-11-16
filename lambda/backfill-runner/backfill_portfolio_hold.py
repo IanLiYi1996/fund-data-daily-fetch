@@ -14,39 +14,22 @@ Runtime characteristics (measured):
 Called via Fargate (task family FundHistoryBackfill) with:
     --mode portfolio [--years 2026,2025] [--limit N]
 
-Resume semantics: skip fund_codes already present in the target Iceberg
-table (any report_date), so partial runs converge on subsequent tries.
-This is the same idempotency contract used by the one-off script that
-seeded the initial data.
+Resume skips only fund_codes already present for the target quarter.
+Source errors fail the run without republishing a partial consumer file.
 """
 from __future__ import annotations
 
 import argparse
 import os
 import re
-import socket
 import sys
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
-import requests
-
-# Force per-request timeout so a hung upstream can't stall a worker
-# indefinitely. 45s comfortably covers a slow-but-alive call while
-# still letting the pool make progress.
-socket.setdefaulttimeout(45)
-_orig_request = requests.Session.request
-def _bounded_request(self, method, url, **kw):
-    kw.setdefault("timeout", 45)
-    return _orig_request(self, method, url, **kw)
-requests.Session.request = _bounded_request  # type: ignore[assignment]
-
-import akshare as ak  # noqa: E402
-
 # Same layout as backfill_fund_history: shared/ ships alongside in the image
 _here = Path(__file__).resolve().parent
 for _cand in (_here.parent, _here / "..", Path("lambda"), Path("/app")):
@@ -55,8 +38,9 @@ for _cand in (_here.parent, _here / "..", Path("lambda"), Path("/app")):
         sys.path.insert(0, str(_cand))
         break
 from shared.storage.iceberg_writer import IcebergWriter  # noqa: E402
+from shared.quality.portfolio_hold import fetch_holdings, quarter_end  # noqa: E402
 from pyiceberg.catalog import load_catalog  # noqa: E402
-from pyiceberg.expressions import EqualTo  # noqa: E402
+from pyiceberg.expressions import EqualTo, GreaterThanOrEqual  # noqa: E402
 
 
 DEFAULT_BUCKET = os.environ.get(
@@ -67,18 +51,8 @@ DEFAULT_WAREHOUSE = os.environ.get(
     "WAREHOUSE_PATH", f"s3://{DEFAULT_BUCKET}/{DEFAULT_S3_PREFIX}iceberg/"
 )
 DEFAULT_REGION = os.environ.get("AWS_REGION", "us-east-1")
+MIN_EXPORT_FUNDS = 14000
 
-# Map "YYYY年N季度..." string → last day of that quarter.
-_QUARTER_END = {
-    (2024, 1): date(2024, 3, 31), (2024, 2): date(2024, 6, 30),
-    (2024, 3): date(2024, 9, 30), (2024, 4): date(2024, 12, 31),
-    (2025, 1): date(2025, 3, 31), (2025, 2): date(2025, 6, 30),
-    (2025, 3): date(2025, 9, 30), (2025, 4): date(2025, 12, 31),
-    (2026, 1): date(2026, 3, 31), (2026, 2): date(2026, 6, 30),
-    (2026, 3): date(2026, 9, 30), (2026, 4): date(2026, 12, 31),
-    (2027, 1): date(2027, 3, 31), (2027, 2): date(2027, 6, 30),
-    (2027, 3): date(2027, 9, 30), (2027, 4): date(2027, 12, 31),
-}
 _QUARTER_RE = re.compile(r"^(\d{4})年(\d)季度")
 
 
@@ -87,45 +61,30 @@ def _parse_quarter(s: str):
     if not m:
         return None
     y, q = int(m.group(1)), int(m.group(2))
-    return _QUARTER_END.get((y, q))
+    return quarter_end(y, q)
 
 
-def _fetch_one(code_name, years):
+def _fetch_one(code_name, years, target_quarter=None):
     code, name = code_name
     frames = []
     err = None
     for yr in years:
-        try:
-            df = ak.fund_portfolio_hold_em(symbol=code, date=str(yr))
-            if df is None or df.empty:
-                continue
-            df = df.copy()
-            df["report_date"] = df["季度"].map(_parse_quarter)
-            df = df[df.report_date.notna()]
-            if df.empty:
-                continue
-            df["fund_code"] = code
-            df = df.rename(columns={
-                "股票代码": "holding_code",
-                "股票名称": "holding_name",
-                "占净值比例": "weight_pct",
-                "持股数": "shares",
-                "持仓市值": "market_value",
-            })
-            # akshare returns 持股数 in 万股, 持仓市值 in 万元 — scale up.
-            df["shares"] = pd.to_numeric(df["shares"], errors="coerce") * 10000
-            df["market_value"] = pd.to_numeric(df["market_value"], errors="coerce") * 10000
-            df["weight_pct"] = pd.to_numeric(df["weight_pct"], errors="coerce")
-            df = df[[
-                "fund_code", "report_date", "holding_code", "holding_name",
-                "weight_pct", "shares", "market_value",
-            ]]
-            frames.append(df)
-        except Exception as e:
-            err = f"{type(e).__name__}: {str(e)[:80]}"
+        for attempt in range(3):
+            try:
+                df = fetch_holdings(code, yr)
+                if target_quarter is not None:
+                    df = df[df.report_date == target_quarter]
+                if not df.empty:
+                    frames.append(df)
+                break
+            except Exception as e:
+                if attempt == 2:
+                    err = f"{type(e).__name__}: {str(e)[:160]}"
+                else:
+                    time.sleep(attempt + 1)
     if not frames:
         return code, None, err or "no-data"
-    return code, pd.concat(frames, ignore_index=True), None
+    return code, pd.concat(frames, ignore_index=True), err
 
 
 def _build_universe(warehouse: str) -> pd.DataFrame:
@@ -138,19 +97,22 @@ def _build_universe(warehouse: str) -> pd.DataFrame:
         "type": "glue", "glue.region": DEFAULT_REGION, "warehouse": warehouse,
     })
     tbl = cat.load_table(("fund_data_lake", "fund_name"))
-    fn = tbl.scan().to_arrow().to_pandas()
+    fn = tbl.scan(
+        row_filter=GreaterThanOrEqual("snapshot_date", date.today() - timedelta(days=7)),
+        selected_fields=("fund_code", "fund_name", "fund_type", "snapshot_date"),
+    ).to_arrow().to_pandas()
+    if fn.empty:
+        raise RuntimeError("no recent fund universe; refusing stale full-history scan")
     latest = fn.snapshot_date.max()
     fn_latest = (fn[fn.snapshot_date == latest]
                  .drop_duplicates("fund_code")
                  .reset_index(drop=True))
 
-    non_equity = [
-        "债券", "纯债", "短债", "中债", "长债", "信用债", "利率债", "转债", "政金债",
-        "货币", "现金", "增利", "余额宝", "天天", "日日", "日利宝", "薪金", "7日",
-        "REITs", "REIT", "不动产",
-    ]
-    pattern = "|".join(non_equity)
-    equity = fn_latest[~fn_latest.fund_name.fillna("").str.contains(pattern, regex=True)]
+    # Names like "增利" and "转债" do not establish that a fund has no stocks.
+    # Only exclude unambiguously non-stock product types.
+    equity = fn_latest[~fn_latest.fund_type.fillna("").str.contains(
+        "货币|纯债|REIT", regex=True, case=False,
+    )]
     return equity[["fund_code", "fund_name"]].reset_index(drop=True)
 
 
@@ -180,8 +142,8 @@ def _load_done_set(
                 selected_fields=("fund_code",),
             ).to_arrow().to_pandas()
         return set(codes.fund_code.unique())
-    except Exception:
-        return set()
+    except Exception as e:
+        raise RuntimeError("cannot read portfolio resume set; refusing blind refresh") from e
 
 
 def _resolve_target_quarter(spec: Optional[str]) -> date:
@@ -197,17 +159,20 @@ def _resolve_target_quarter(spec: Optional[str]) -> date:
         if not m:
             raise ValueError(f"invalid --target-quarter: {spec}")
         y, q = int(m.group(1)), int(m.group(2))
-        return _QUARTER_END[(y, q)]
+        result = quarter_end(y, q)
+        if result > date.today():
+            raise ValueError("target quarter is in the future")
+        return result
 
     today = date.today()
     year = today.year
     if today.month <= 3:
-        return _QUARTER_END[(year - 1, 4)]
+        return quarter_end(year - 1, 4)
     if today.month <= 6:
-        return _QUARTER_END[(year, 1)]
+        return quarter_end(year, 1)
     if today.month <= 9:
-        return _QUARTER_END[(year, 2)]
-    return _QUARTER_END[(year, 3)]
+        return quarter_end(year, 2)
+    return quarter_end(year, 3)
 
 
 def main() -> int:
@@ -223,6 +188,9 @@ def main() -> int:
                    help="Cap total funds processed (0=all)")
     p.add_argument("--force", action="store_true",
                    help="Ignore resume set and re-fetch every fund")
+    p.add_argument("--export-only", action="store_true")
+    p.add_argument("--no-export", action="store_true",
+                   help="Commit a canary/bounded batch without publishing a consumer file")
     p.add_argument("--target-quarter", default=None,
                    help=("Quarter to refresh, e.g. '2026-Q3'. Resume skips "
                          "fund_codes that already have a row for this quarter; "
@@ -232,6 +200,8 @@ def main() -> int:
                          "opened). Pass '--target-quarter all' to fall back "
                          "to full-universe backfill semantics."))
     args = p.parse_args()
+    if not 1 <= args.workers <= 16 or args.batch < 1:
+        p.error("workers must be 1..16 and batch must be positive")
 
     if args.target_quarter and args.target_quarter.lower() == "all":
         target_quarter: Optional[date] = None
@@ -250,6 +220,9 @@ def main() -> int:
         cur = date.today().year
         years = [cur, cur - 1]
     print(f"years: {years}", flush=True)
+    if args.export_only:
+        _export_flat_parquet(args.warehouse, target_quarter)
+        return 0
 
     universe = _build_universe(args.warehouse)
     print(f"universe (equity-like): {len(universe):,}", flush=True)
@@ -271,6 +244,8 @@ def main() -> int:
 
     if todo.empty:
         print("nothing to do", flush=True)
+        if not args.no_export:
+            _export_flat_parquet(args.warehouse, target_quarter)
         return 0
 
     writer = IcebergWriter(
@@ -279,17 +254,20 @@ def main() -> int:
 
     pending: list[pd.DataFrame] = []
     ok = empty = total_rows = 0
+    errors = {}
     t0 = time.time()
 
     items = list(zip(todo.fund_code, todo.fund_name))
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(_fetch_one, item, years): item for item in items}
+        futs = {ex.submit(_fetch_one, item, years, target_quarter): item for item in items}
         for i, fut in enumerate(as_completed(futs), 1):
             try:
                 code, df, _err = fut.result(timeout=60)
-            except Exception:
-                empty += 1
+            except Exception as e:
+                errors[futs[fut][0]] = f"{type(e).__name__}: {str(e)[:160]}"
                 continue
+            if _err and _err != "no-data":
+                errors[code] = _err
             if df is None or df.empty:
                 empty += 1
             else:
@@ -303,25 +281,50 @@ def main() -> int:
                       f"elapsed={elapsed:.0f}s ETA={eta_min:.0f}min", flush=True)
             if i % args.batch == 0 and pending:
                 merged = pd.concat(pending, ignore_index=True)
-                r = writer.write(
-                    "fund_portfolio_hold", merged, fetch_date=date.today(),
-                )
+                r = _commit_batch(writer, merged, target_quarter, args.force)
+                if "error" in r:
+                    raise RuntimeError(f"portfolio batch commit failed: {r}")
                 print(f"  flush {i}: {len(merged)} rows → {r}", flush=True)
                 pending = []
 
     if pending:
         merged = pd.concat(pending, ignore_index=True)
-        r = writer.write("fund_portfolio_hold", merged, fetch_date=date.today())
+        r = _commit_batch(writer, merged, target_quarter, args.force)
+        if "error" in r:
+            raise RuntimeError(f"portfolio final commit failed: {r}")
         print(f"  final: {len(merged)} rows → {r}", flush=True)
 
-    print(f"\nDONE ok={ok} empty={empty} rows={total_rows} "
+    print(f"\nDONE ok={ok} empty={empty} errors={len(errors)} rows={total_rows} "
           f"elapsed={time.time()-t0:.0f}s", flush=True)
-
-    _export_flat_parquet(args.warehouse)
+    if errors:
+        import json
+        print("SOURCE_ERRORS " + json.dumps(errors, ensure_ascii=False), flush=True)
+        return 1
+    if not args.no_export:
+        _export_flat_parquet(args.warehouse, target_quarter)
     return 0
 
 
-def _export_flat_parquet(warehouse: str) -> None:
+def _commit_batch(writer, frame, target_quarter, force):
+    # Resume excluded every existing fund/quarter and only target rows are
+    # fetched. Appending those new keys avoids rescanning 1.4M historical
+    # holdings for every 100 funds. Force/full-history retains upsert semantics.
+    if target_quarter is not None and not force:
+        if not frame.report_date.eq(target_quarter).all():
+            raise ValueError("portfolio batch escaped its target quarter")
+        result = writer._write_inline(
+            "fund_portfolio_hold", frame, date.today(), force_append=True,
+        )
+        if result.get("rows_appended") != len(frame):
+            raise RuntimeError(f"portfolio append did not commit all rows: {result}")
+        return result
+    result = writer.write("fund_portfolio_hold", frame, fetch_date=date.today())
+    if result.get("skipped") or "error" in result:
+        raise RuntimeError(f"portfolio upsert failed: {result}")
+    return result
+
+
+def _export_flat_parquet(warehouse: str, target_quarter=None) -> None:
     """Dedup + write flat parquet under fund/_history/ so it replicates
     to financial-dataset-mx alongside fund_manager_history /
     fund_scale_history. This is the file Mengxin's team reads directly.
@@ -329,6 +332,7 @@ def _export_flat_parquet(warehouse: str) -> None:
     import tempfile
     import boto3
     import duckdb
+    from botocore.exceptions import ClientError
 
     bucket = DEFAULT_BUCKET
     prefix = DEFAULT_S3_PREFIX  # "fund-data-pipeline/"
@@ -356,33 +360,79 @@ def _export_flat_parquet(warehouse: str) -> None:
 
     with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
         tmp = f.name
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+        baseline = f.name
+    s3 = boto3.client("s3", region_name=DEFAULT_REGION)
+    baseline_head = None
     try:
+        # Keep all previously published historical keys and their values.
+        # Only the explicitly refreshed quarter can supersede baseline rows.
+        # This also protects older funds no longer in the live name universe.
+        columns = ("fund_code, report_date, holding_code, holding_name, "
+                   "weight_pct, shares, market_value")
+        source = f"SELECT {columns}, 0 AS precedence FROM read_parquet({live_files!r})"
+        try:
+            baseline_head = s3.head_object(Bucket=bucket, Key=key)
+            extra = {"VersionId": baseline_head["VersionId"]} if baseline_head.get("VersionId") else {}
+            s3.download_file(bucket, key, baseline, ExtraArgs=extra)
+            priority = (
+                f"CASE WHEN report_date = DATE '{target_quarter}' THEN -1 ELSE 1 END"
+                if target_quarter is not None else "1"
+            )
+            source += f" UNION ALL SELECT {columns}, {priority} AS precedence FROM read_parquet('{baseline}')"
+        except ClientError as e:
+            if e.response["Error"]["Code"] not in ("404", "NoSuchKey", "NotFound"):
+                raise
         con.sql(f"""
             COPY (
                 WITH ranked AS (
                     SELECT *, row_number() OVER (
                         PARTITION BY fund_code, report_date, holding_code
-                        ORDER BY report_date DESC
+                        ORDER BY precedence DESC, weight_pct DESC NULLS LAST,
+                                 shares DESC NULLS LAST, market_value DESC NULLS LAST
                     ) AS rn
-                    FROM read_parquet({live_files!r})
+                    FROM ({source})
+                    WHERE report_date <= DATE '{date.today()}'
                 )
                 SELECT fund_code, report_date, holding_code, holding_name,
                        weight_pct, shares, market_value
                 FROM ranked WHERE rn = 1
             ) TO '{tmp}' (FORMAT PARQUET, COMPRESSION SNAPPY)
         """)
-        rows = con.sql(f"SELECT count(*) FROM read_parquet('{tmp}')").fetchone()[0]
-        funds = con.sql(f"SELECT count(DISTINCT fund_code) FROM read_parquet('{tmp}')").fetchone()[0]
+        rows = con.sql(f"SELECT count(*) FROM read_parquet('{tmp}')").fetchall()[0][0]
+        funds = con.sql(f"SELECT count(DISTINCT fund_code) FROM read_parquet('{tmp}')").fetchall()[0][0]
+        if funds < MIN_EXPORT_FUNDS:
+            raise RuntimeError(f"partial portfolio export: {funds} funds < {MIN_EXPORT_FUNDS}")
+        if target_quarter is not None:
+            quarter_counts = dict(con.sql(
+                f"SELECT report_date, count(DISTINCT fund_code) "
+                f"FROM read_parquet('{tmp}') GROUP BY report_date"
+            ).fetchall())
+            previous = max((q for q in quarter_counts if q < target_quarter), default=None)
+            if previous is None or quarter_counts.get(target_quarter, 0) < .9 * quarter_counts[previous]:
+                raise RuntimeError(f"target quarter coverage incomplete: {quarter_counts}")
         size = os.path.getsize(tmp)
         print(f"  {rows:,} rows / {funds:,} funds / {size:,} bytes", flush=True)
 
-        boto3.client("s3", region_name=DEFAULT_REGION).upload_file(tmp, bucket, key)
+        if baseline_head is not None:
+            current_head = s3.head_object(Bucket=bucket, Key=key)
+            if current_head["ETag"] != baseline_head["ETag"]:
+                raise RuntimeError("portfolio consumer file changed during export; refusing overwrite")
+        metadata = {"rows": str(rows), "funds": str(funds)}
+        if target_quarter is not None:
+            metadata.update({
+                "target-quarter": target_quarter.isoformat(),
+                "target-funds": str(quarter_counts[target_quarter]),
+            })
+        s3.upload_file(tmp, bucket, key, ExtraArgs={"Metadata": metadata})
         print(f"  uploaded: s3://{bucket}/{key}", flush=True)
     finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        con.close()
+        for path in (tmp, baseline):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
