@@ -1,0 +1,7 @@
+# Preserve the verified production dependencies; replace only portfolio code.
+# The caller must supply an immutable ECR image digest.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+COPY backfill-runner/backfill_portfolio_hold.py /app/backfill_portfolio_hold.py
+COPY shared/quality/portfolio_hold.py /app/shared/quality/portfolio_hold.py
+COPY shared/quality/__init__.py /app/shared/quality/__init__.py

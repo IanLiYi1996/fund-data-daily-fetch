@@ -1226,24 +1226,37 @@ export class FundDataFetchStack extends Stack {
     [listBucketPolicy, objectPolicy, icebergGluePolicy].forEach((stmt) =>
       backfillTaskDef.taskRole.addToPrincipalPolicy(stmt)
     );
+    // Preserve the explicitly approved live inline-policy name. Only the
+    // portfolio baseline needs version reads; do not widen the S3 wildcard.
+    new iam.Policy(this, "PortfolioConsumerVersionRead", {
+      policyName: "PortfolioConsumerVersionRead",
+      roles: [backfillTaskDef.taskRole],
+      statements: [
+        new iam.PolicyStatement({
+          actions: ["s3:GetObjectVersion"],
+          resources: [
+            `arn:aws:s3:::${bucketName}/${s3Prefix}fund/_history/fund_portfolio_hold_history.parquet`,
+          ],
+        }),
+      ],
+    });
     backfillTaskDef.node.addDependency(glueDatabase);
 
-    // Quarterly: fund_portfolio_hold refresh — Apr/Jul/Oct/Jan 25th at 20:00 UTC
-    // Q1 (mar-end) disclosed by Apr 22; Q2 by Aug 30; Q3 by Oct 26; Q4 by Mar 30 next year.
-    // Running 25th of the month after quarter-end catches Q1/Q3 easily; Q2/Q4 are
-    // late-disclosure quarters (full holdings) so we schedule two more attempts.
+    // Refresh top holdings after the quarterly disclosure window, not on
+    // the 25th while disclosures are still arriving. The portfolio runner
+    // refuses to publish a quarter with less than 90% of prior-quarter funds.
     const portfolioQuarterlyRule = new events.Rule(
       this,
       "FundPortfolioHoldQuarterlySchedule",
       {
         ruleName: "FundPortfolioHoldQuarterlySchedule",
         description:
-          "Quarterly refresh of fund_portfolio_hold (25th of Apr/Jul/Oct/Jan at 20:00 UTC)",
+          "Quarterly refresh of fund_portfolio_hold (5th of May/Aug/Nov/Feb at 20:00 UTC)",
         schedule: events.Schedule.cron({
           minute: "0",
           hour: "20",
-          day: "25",
-          month: "1,4,7,10",
+          day: "5",
+          month: "2,5,8,11",
         }),
       }
     );
@@ -1256,7 +1269,7 @@ export class FundDataFetchStack extends Stack {
         containerOverrides: [
           {
             containerName: "backfill",
-            command: ["--mode", "portfolio"],
+            command: ["--mode", "portfolio", "--refresh-existing"],
           },
         ],
       })

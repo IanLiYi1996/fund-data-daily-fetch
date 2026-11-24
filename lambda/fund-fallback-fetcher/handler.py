@@ -281,7 +281,7 @@ def _existing_pairs(catalog, start_date: date, end_date: date) -> set:
 def _verify_money_funds(
     catalog, target: date, writer: "IcebergWriter",
 ) -> Dict[str, Any]:
-    """Re-assert money-market NAVs from lsjz, writing only where we disagree.
+    """Re-assert money-market history, filling holes and correcting wrong values.
 
     The daily snapshot endpoint reports 每万份收益 for some money funds as an
     accrual covering everything since their last publication, not for the one
@@ -296,8 +296,8 @@ def _verify_money_funds(
     per day, including Saturday and Sunday), so its value wins.
 
     Only ~977 codes are money-market, so re-checking all of them costs about a
-    thousand requests. Rows are written ONLY where the values differ, which
-    keeps the daily volume at a handful rather than ~977 duplicates; the
+    thousand requests. Write only missing source dates or differing values,
+    keeping daily volume small rather than appending ~977 duplicates; the
     ingested_at tiebreak then makes the new row authoritative in both the export
     and weekly compaction, so no delete is required.
     """
@@ -305,10 +305,10 @@ def _verify_money_funds(
     fn = name_tbl.scan().to_arrow().to_pandas()
     fn = fn[fn.snapshot_date == fn.snapshot_date.max()].drop_duplicates("fund_code")
     if "fund_type" not in fn.columns:
-        return {"checked": 0, "corrected": 0}
+        return {"checked": 0, "corrected": 0, "added": 0}
     money = fn[fn.fund_type.fillna("").str.startswith("货币型")]
     if money.empty:
-        return {"checked": 0, "corrected": 0}
+        return {"checked": 0, "corrected": 0, "added": 0}
 
     # Check a WINDOW, not just the target day. The snapshot endpoint returns
     # today AND yesterday, so the run on day D rewrites day D-1 — and it
@@ -332,7 +332,7 @@ def _verify_money_funds(
     ).to_arrow().to_pandas()
     held = held[held.unit_nav.notna()]
     if held.empty:
-        return {"checked": 0, "corrected": 0}
+        return {"checked": 0, "corrected": 0, "added": 0}
     # Compare against the row the consumer actually gets — newest write per
     # (code, date) — or a stale duplicate would look like a live discrepancy
     # and get "corrected" on every single run.
@@ -359,14 +359,18 @@ def _verify_money_funds(
             code, df, _err = fut.result()
             if df is None or df.empty:
                 continue
+            if not df.trade_date.between(window_start, target).all():
+                raise ValueError("Upstream returned dates outside the verified window")
             bad = df[df.apply(
                 lambda r: (
-                    (code, r.trade_date) in ours
-                    and r.unit_nav is not None
+                    r.unit_nav is not None
                     and not pd.isna(r.unit_nav)
-                    and abs(float(r.unit_nav)
-                            - float(ours[(code, r.trade_date)]))
-                    > MONEY_NAV_TOLERANCE
+                    and (
+                        (code, r.trade_date) not in ours
+                        or abs(float(r.unit_nav)
+                               - float(ours[(code, r.trade_date)]))
+                        > MONEY_NAV_TOLERANCE
+                    )
                 ),
                 axis=1,
             )] if not df.empty else df
@@ -374,12 +378,19 @@ def _verify_money_funds(
                 frames.append(bad)
 
     if not frames:
-        return {"checked": len(items), "corrected": 0}
+        return {"checked": len(items), "corrected": 0, "added": 0}
 
-    merged = pd.concat(frames, ignore_index=True)
-    writer.write("fund_daily", merged, fetch_date=target)
+    merged = pd.concat(frames, ignore_index=True).drop_duplicates(
+        ["fund_code", "trade_date"], keep="last",
+    )
+    added = sum((r.fund_code, r.trade_date) not in ours for r in merged.itertuples())
+    corrected = len(merged) - added
+    result = writer.write("fund_daily", merged, fetch_date=target)
+    if (not isinstance(result, dict) or result.get("error")
+            or result.get("rows_appended", result.get("rows_inserted", 0)) != len(merged)):
+        raise RuntimeError("Money history repair was not completely committed")
     logger.info(
-        f"money verify: corrected {len(merged)} rows over "
+        f"money verify: added {added}, corrected {corrected} rows over "
         f"{window_start}..{target} across {len(items)} funds: "
         + ", ".join(f"{r.fund_code}@{r.trade_date}"
                     for _, r in merged.head(10).iterrows())
@@ -387,7 +398,8 @@ def _verify_money_funds(
     return {
         "checked": len(items),
         "window": f"{window_start}..{target}",
-        "corrected": int(len(merged)),
+        "corrected": int(corrected),
+        "added": int(added),
         "codes": [f"{r.fund_code}@{r.trade_date}"
                   for _, r in merged.head(20).iterrows()],
     }

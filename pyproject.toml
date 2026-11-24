@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 
 [dependency-groups]
 dev = [
+    "duckdb==2.0.0",
     "pytest>=8.0",
     "pytest-mock>=3.12",
     "moto[s3,glue]>=5.0",
