@@ -1,0 +1,7 @@
+# Preserve the deployed batching, FOF, HTTP, writer and dependency versions.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG EXPECTED_HANDLER_SHA
+COPY fund-fallback-fetcher/patch_money_history.py /tmp/patch_money_history.py
+RUN python /tmp/patch_money_history.py /var/task/handler.py \
+    --expected-sha "${EXPECTED_HANDLER_SHA}"
